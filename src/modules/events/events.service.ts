@@ -8,31 +8,6 @@ import type {
   GetEventsQuery,
 } from './events.schema.js';
 
-/**
- * ================================================================
- * Zero Plus - Events Service
- * ================================================================
- *
- * مسؤول عن:
- * - إنشاء Security Events
- * - التأكد أن الـ Server تابع لنفس الـ Organization
- * - التأكد أن Reputation Entry تابع لنفس الـ Organization
- * - جلب الـ Events مع Filtering / Pagination / Sorting
- * - جلب Event واحد بالتفصيل
- *
- * ملاحظة:
- * الـ Events تعتبر Audit/Security Logs لذلك لا يوجد هنا:
- * - updateEvent
- * - deleteEvent
- *
- * لأنها في النظام المفروض تكون immutable.
- * ================================================================
- */
-
-/**
- * Error مخصص نستخدمه مع Fastify
- * حتى يرجع HTTP status مناسب بدل 500.
- */
 class EventServiceError extends Error {
   public readonly statusCode: number;
 
@@ -53,14 +28,6 @@ export async function createEvent(
   organizationId: string,
   data: CreateEventInput,
 ) {
-  /**
-   * --------------------------------------------------------------
-   * 1. التأكد أن الـ Server موجود وتابع لنفس الـ Organization
-   * --------------------------------------------------------------
-   *
-   * مهم جدًا لمنع شركة من تسجيل Event على Server
-   * تابع لشركة أخرى.
-   */
   const server = await fastify.prisma.server.findFirst({
     where: {
       id: data.serverId,
@@ -78,11 +45,6 @@ export async function createEvent(
     );
   }
 
-  /**
-   * --------------------------------------------------------------
-   * 2. لو فيه Reputation Entry نتأكد أنه تابع لنفس المؤسسة
-   * --------------------------------------------------------------
-   */
   if (data.reputationEntryId) {
     const reputationEntry =
       await fastify.prisma.reputationEntry.findFirst({
@@ -103,18 +65,6 @@ export async function createEvent(
     }
   }
 
-  /**
-   * --------------------------------------------------------------
-   * 3. إنشاء الـ Event
-   * --------------------------------------------------------------
-   *
-   * ممنوع استخدام:
-   *
-   *   ...data
-   *
-   * لأننا نريد التحكم في الـ fields التي تدخل قاعدة البيانات
-   * وعدم السماح لأي field غير متوقع بالدخول.
-   */
   const event = await fastify.prisma.securityEvent.create({
     data: {
       serverId: data.serverId,
@@ -124,9 +74,10 @@ export async function createEvent(
       path: data.path,
       method: data.method,
 
-      userAgent: data.userAgent,
-      referer: data.referer,
-      requestId: data.requestId,
+      // استخدام ?? null لتفادي تعارض TypeScript مع Prisma
+      userAgent: data.userAgent ?? null,
+      referer: data.referer ?? null,
+      requestId: data.requestId ?? null,
 
       riskScore: data.riskScore,
       anomalyScore: data.anomalyScore,
@@ -134,25 +85,20 @@ export async function createEvent(
 
       decision: data.decision,
 
-      reasonSummary: data.reasonSummary,
+      reasonSummary: data.reasonSummary ?? null,
 
-      /**
-       * Prisma Json يحتاج InputJsonValue.
-       * الـ schema عندنا يسمح Record<string, unknown>
-       * لذلك نعمل cast هنا بعد التحقق بواسطة Zod.
-       */
       reasonDetails: data.reasonDetails
         ? (data.reasonDetails as Prisma.InputJsonObject)
-        : undefined,
+        : Prisma.JsonNull,
 
-      countryCode: data.countryCode,
-      asn: data.asn,
-      ipType: data.ipType,
+      countryCode: data.countryCode ?? null,
+      asn: data.asn ?? null,
+      ipType: data.ipType ?? null,
 
       isChallenged: data.isChallenged ?? false,
-      challengePassed: data.challengePassed,
+      challengePassed: data.challengePassed ?? null,
 
-      reputationEntryId: data.reputationEntryId,
+      reputationEntryId: data.reputationEntryId ?? null,
     },
   });
 
@@ -169,56 +115,22 @@ export async function getEvents(
   organizationId: string,
   query: GetEventsQuery,
 ) {
-  /**
-   * --------------------------------------------------------------
-   * Pagination
-   * --------------------------------------------------------------
-   *
-   * page و limit تم تحويلهم بالفعل إلى numbers
-   * داخل Zod schema.
-   */
   const page = query.page;
   const limit = query.limit;
-
   const skip = (page - 1) * limit;
 
-  /**
-   * --------------------------------------------------------------
-   * Base WHERE
-   * --------------------------------------------------------------
-   *
-   * أهم نقطة في Events:
-   *
-   * كل Query لازم يبدأ بـ organizationId
-   * حتى لا يرى المستخدم Events الخاصة بمؤسسة أخرى.
-   */
   const where: Prisma.SecurityEventWhereInput = {
     organizationId,
   };
 
-  /**
-   * --------------------------------------------------------------
-   * Server Filter
-   * --------------------------------------------------------------
-   */
   if (query.serverId) {
     where.serverId = query.serverId;
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Decision Filter
-   * --------------------------------------------------------------
-   */
   if (query.decision) {
     where.decision = query.decision;
   }
 
-  /**
-   * --------------------------------------------------------------
-   * IP Address Filter
-   * --------------------------------------------------------------
-   */
   if (query.ipAddress) {
     where.ipAddress = {
       contains: query.ipAddress,
@@ -226,38 +138,18 @@ export async function getEvents(
     };
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Country
-   * --------------------------------------------------------------
-   */
   if (query.countryCode) {
     where.countryCode = query.countryCode;
   }
 
-  /**
-   * --------------------------------------------------------------
-   * IP Type
-   * --------------------------------------------------------------
-   */
   if (query.ipType) {
     where.ipType = query.ipType;
   }
 
-  /**
-   * --------------------------------------------------------------
-   * HTTP Method
-   * --------------------------------------------------------------
-   */
   if (query.method) {
     where.method = query.method;
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Path
-   * --------------------------------------------------------------
-   */
   if (query.path) {
     where.path = {
       contains: query.path,
@@ -265,11 +157,6 @@ export async function getEvents(
     };
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Risk Score Range
-   * --------------------------------------------------------------
-   */
   if (
     query.minRiskScore !== undefined ||
     query.maxRiskScore !== undefined
@@ -285,11 +172,6 @@ export async function getEvents(
     }
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Challenge Filters
-   * --------------------------------------------------------------
-   */
   if (query.isChallenged !== undefined) {
     where.isChallenged = query.isChallenged;
   }
@@ -298,20 +180,10 @@ export async function getEvents(
     where.challengePassed = query.challengePassed;
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Reputation Entry Filter
-   * --------------------------------------------------------------
-   */
   if (query.reputationEntryId) {
     where.reputationEntryId = query.reputationEntryId;
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Date Range
-   * --------------------------------------------------------------
-   */
   if (query.startDate || query.endDate) {
     where.createdAt = {};
 
@@ -324,13 +196,6 @@ export async function getEvents(
     }
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Global Search
-   * --------------------------------------------------------------
-   *
-   * يبحث في أهم الحقول النصية.
-   */
   if (query.search) {
     where.OR = [
       {
@@ -341,12 +206,6 @@ export async function getEvents(
       },
       {
         path: {
-          contains: query.search,
-          mode: 'insensitive',
-        },
-      },
-      {
-        method: {
           contains: query.search,
           mode: 'insensitive',
         },
@@ -378,14 +237,6 @@ export async function getEvents(
     ];
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Sorting
-   * --------------------------------------------------------------
-   *
-   * الـ schema يمنع أي field غير الموجود في القائمة.
-   * هنا فقط نربطه بحقول Prisma.
-   */
   const sortFieldMap = {
     createdAt: 'createdAt',
     riskScore: 'riskScore',
@@ -400,22 +251,12 @@ export async function getEvents(
     [sortField]: query.sortOrder,
   };
 
-  /**
-   * --------------------------------------------------------------
-   * Query Database
-   * --------------------------------------------------------------
-   */
   const [events, total, aggregate] = await Promise.all([
     fastify.prisma.securityEvent.findMany({
       where,
       skip,
       take: limit,
       orderBy,
-
-      /**
-       * نجيب الـ server كـ summary بسيط
-       * بدل ما نرجع كل بياناته.
-       */
       include: {
         server: {
           select: {
@@ -438,23 +279,11 @@ export async function getEvents(
     }),
   ]);
 
-  /**
-   * --------------------------------------------------------------
-   * Summary
-   * --------------------------------------------------------------
-   *
-   * أرقام إضافية مفيدة للـ dashboard.
-   */
   const summary = {
     totalEvents: total,
     averageRiskScore: aggregate._avg.riskScore ?? 0,
   };
 
-  /**
-   * --------------------------------------------------------------
-   * Response
-   * --------------------------------------------------------------
-   */
   return {
     success: true,
 
@@ -483,21 +312,11 @@ export async function getEventById(
   organizationId: string,
   eventId: string,
 ) {
-  /**
-   * organizationId جزء أساسي من الـ where
-   * حتى لو المستخدم يعرف ID Event خاص بشركة أخرى
-   * لن يستطيع الوصول إليه.
-   */
   const event = await fastify.prisma.securityEvent.findFirst({
     where: {
       id: eventId,
       organizationId,
     },
-
-    /**
-     * صفحة التفاصيل تحتاج معلومات الـ Server
-     * والـ Reputation المرتبطة بالحدث.
-     */
     include: {
       server: {
         select: {
