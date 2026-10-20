@@ -1,0 +1,532 @@
+// ==================================================================
+// Zero Plus - Database Schema
+// Auth: WebAuthn / Passkeys (بصمة إصبع أو وجه)
+// السيرفر يخزّن Public Key فقط — Private Key ما بيسيبش جهاز المستخدم
+// Prisma 6.x / 7.x compatible
+// Collective Immunity: معلّق مؤقتًا
+// ==================================================================
+
+generator client {
+  provider = "prisma-client-js"
+  // output   = "../generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+  // url      = env("DATABASE_URL")
+}
+
+// ==================================================================
+// ENUMS
+// ==================================================================
+
+enum UserRole {
+  OWNER
+  ADMIN
+  ANALYST
+  VIEWER
+}
+
+enum ServerStatus {
+  PENDING
+  ONLINE
+  DEGRADED
+  OFFLINE
+  MAINTENANCE
+}
+
+enum ServerMode {
+  PROTECT
+  MONITOR_ONLY
+}
+
+enum Decision {
+  ALLOW
+  MONITOR
+  RATE_LIMIT
+  CHALLENGE
+  BLOCK
+}
+
+enum BanStatus {
+  NONE
+  TEMPORARY
+  PERMANENT
+}
+
+enum IpType {
+  RESIDENTIAL
+  MOBILE
+  DATACENTER
+  VPN_PROXY
+  TOR
+  UNKNOWN
+}
+
+enum ThreatCategory {
+  DDOS_BURST
+  BOTNET
+  BRUTE_FORCE
+  SCRAPER
+  SUSPICIOUS_BEHAVIOR
+  KNOWN_MALICIOUS
+  SMOKESCREEN
+  OTHER
+}
+
+enum NotificationType {
+  DDOS_START
+  NEW_BLOCK
+  CRITICAL_REPUTATION
+  SERVER_CAPACITY_WARNING
+  SERVER_RECOVERY
+  POLICY_CHANGED
+  SYSTEM
+}
+
+enum ReportStatus {
+  PENDING
+  GENERATING
+  READY
+  FAILED
+}
+
+enum ChallengeType {
+  JS_SILENT
+  TLS_FINGERPRINT
+  RATE_LIMIT_SOFT
+  CAPTCHA_FALLBACK
+}
+
+enum DetectionStage {
+  BAN_LIST
+  PASS_TOKEN
+  IP_LOOKUP
+  JS_CHALLENGE
+  HISTORY_MATCH
+  DEEP_COMPARISON
+  TLS_FINGERPRINT
+  AI_ANOMALY
+  HARD_LIMIT
+  POLICY
+  SURGE_DETECTED
+  CLEARANCE_REVOKED
+}
+
+enum SimulationPattern {
+  NORMAL
+  SUSPICIOUS_BURST
+  REPEATED_REQUESTS
+  UNUSUAL_BEHAVIOR
+  KNOWN_TEST_SOURCE
+}
+
+enum SimulationStatus {
+  RUNNING
+  STOPPED
+  COMPLETED
+  FAILED
+}
+
+// ==================================================================
+// CORE TENANT
+// ==================================================================
+
+model Organization {
+  id          String   @id @default(uuid())
+  name        String
+  slug        String   @unique
+  plan        String   @default("free")
+  isActive    Boolean  @default(true)
+
+  // نقطة بداية موديل الـ AI
+  sizeProfile String   @default("medium") // small | medium | large
+
+  users               User[]
+  servers             Server[]
+  securityEvents      SecurityEvent[]
+  reputationEntries   ReputationEntry[]
+  challengeLogs       ChallengeLog[]
+  policy              Policy?
+  notifications       Notification[]
+  reports             Report[]
+  simulationRuns      SimulationRun[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([slug])
+}
+
+model User {
+  id             String    @id @default(uuid())
+
+  // للإظهار والتواصل — مش وسيلة الدخول
+  email          String    @unique
+  fullName       String
+  role           UserRole  @default(OWNER)
+  isActive       Boolean   @default(true)
+  lastLoginAt    DateTime?
+
+  // احتياطي اختياري فقط (مش للدخول الأساسي)
+  passwordHash   String?
+
+  uiPreferences  Json?
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  // المفاتيح العامة المسجّلة (Passkeys)
+  passkeys       PasskeyCredential[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId])
+  @@index([email])
+}
+
+// ==================================================================
+// AUTH — WebAuthn / Passkeys
+// السيرفر يخزّن: credentialId + publicKey + counter
+// Private Key يبقى داخل Secure Enclave / TPM على جهاز المستخدم
+// ==================================================================
+
+model PasskeyCredential {
+  id            String    @id @default(uuid())
+
+  // معرّف الـ credential من WebAuthn (unique عالميًا)
+  credentialId  String    @unique
+
+  // المفتاح العام فقط (Bytes) — عديم الفائدة بدون الـ private key
+  publicKey     Bytes
+
+  // لحماية من replay (WebAuthn signature counter)
+  counter       Int       @default(0)
+
+  // usb / nfc / ble / internal (platform authenticator = بصمة/وجه)
+  transports    String[]
+
+  // اسم للعرض: "iPhone Face ID" / "Windows Hello" / "Android Fingerprint"
+  deviceName    String?
+
+  // AAGUID للـ authenticator (اختياري)
+  aaguid        String?
+
+  lastUsedAt    DateTime?
+  isRevoked     Boolean   @default(false)
+
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+
+  @@index([userId])
+  @@index([credentialId])
+}
+
+// ==================================================================
+// PROTECTED SERVERS
+// ==================================================================
+
+model Server {
+  id                   String       @id @default(uuid())
+  domain               String       @unique
+  originIp             String
+  originPort           Int          @default(443)
+  status               ServerStatus @default(PENDING)
+  mode                 ServerMode   @default(PROTECT)
+
+  maxRequestsPerSecond Int?
+  cpuCores             Int?
+  ramMb                Int?
+  avgResponseTimeMs    Int?
+  currentLoadPercent   Float?
+  lastHealthCheckAt    DateTime?
+
+  verificationToken    String       @default(uuid())
+  dnsVerified          Boolean      @default(false)
+  dnsVerifiedAt        DateTime?
+  gatewayReachable     Boolean      @default(false)
+  originReachable      Boolean      @default(false)
+  sslEnabled           Boolean      @default(true)
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  securityEvents SecurityEvent[]
+  simulationRuns SimulationRun[]
+  challengeLogs  ChallengeLog[]
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId])
+  @@index([status])
+}
+
+// ==================================================================
+// REPUTATION (لزوار الموقع المحمي — مش لدخول الداشبورد)
+// deviceFingerprint هنا = بصمة متصفح الزائر (Canvas/JA4) لكشف البوتات
+// ==================================================================
+
+model ReputationEntry {
+  id                  String    @id @default(uuid())
+
+  ipAddress           String
+  deviceFingerprint   String?   // بصمة متصفح الزائر (مش Passkey)
+  ja3Fingerprint      String?
+  ja4Fingerprint      String?
+
+  countryCode         String?
+  asn                 Int?
+  asOrg               String?
+  ipType              IpType    @default(UNKNOWN)
+
+  score               Int       @default(1)
+  banStatus           BanStatus @default(NONE)
+  bannedUntil         DateTime?
+  bannedAt            DateTime?
+  banReason           String?
+  isManualBan         Boolean   @default(false)
+  isAllowlisted       Boolean   @default(false)
+
+  failedChecksCount   Int       @default(0)
+  jsFailCount         Int       @default(0)
+  advancedFailCount   Int       @default(0)
+  collectiveHitCount  Int       @default(0)
+  successfulChecks    Int       @default(0)
+  totalRequests       Int       @default(0)
+  lastFailedAt        DateTime?
+
+  lastPath            String?
+  lastUserAgent       String?
+  avgRequestRate      Float?
+  isKnownBotnet       Boolean   @default(false)
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  securityEvents SecurityEvent[]
+  challenges     ChallengeLog[]
+
+  firstSeenAt DateTime @default(now())
+  lastSeenAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  @@unique([organizationId, ipAddress])
+  @@index([organizationId])
+  @@index([banStatus])
+  @@index([bannedUntil])
+  @@index([score])
+  @@index([deviceFingerprint])
+  @@index([ja3Fingerprint])
+  @@index([ja4Fingerprint])
+  @@index([ipType])
+}
+
+// ==================================================================
+// SECURITY EVENTS
+// ==================================================================
+
+model SecurityEvent {
+  id               String   @id @default(uuid())
+
+  ipAddress        String
+  path             String
+  method           String
+  userAgent        String?
+  referer          String?
+  requestId        String?
+
+  riskScore        Int
+  anomalyScore     Float?
+  confidence       Float?
+  decision         Decision
+  decidedAtStage   DetectionStage?
+  reasonSummary    String?
+  reasonDetails    Json?
+  processingTimeMs Int?
+
+  surgeDetected    Boolean  @default(false)
+  pathSensitive    Boolean  @default(false)
+  recommendation   String?
+
+  countryCode      String?
+  asn              Int?
+  ipType           IpType?
+  isChallenged     Boolean  @default(false)
+  challengeType    ChallengeType?
+  challengePassed  Boolean?
+
+  serverId           String
+  server             Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  organizationId     String
+  organization       Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+  reputationEntryId  String?
+  reputationEntry    ReputationEntry? @relation(fields: [reputationEntryId], references: [id])
+
+  reports Report[]
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId])
+  @@index([serverId])
+  @@index([ipAddress])
+  @@index([decision])
+  @@index([riskScore])
+  @@index([createdAt])
+  @@index([organizationId, createdAt])
+  @@index([serverId, createdAt])
+}
+
+// ==================================================================
+// CHALLENGE LOGS
+// ==================================================================
+
+model ChallengeLog {
+  id                String        @id @default(uuid())
+  challengeType     ChallengeType
+  passed            Boolean
+  durationMs        Int?
+  failureReason     String?
+  reputationDelta   Int           @default(0)
+
+  reputationEntryId String
+  reputationEntry   ReputationEntry @relation(fields: [reputationEntryId], references: [id], onDelete: Cascade)
+  serverId          String?
+  server            Server?       @relation(fields: [serverId], references: [id], onDelete: SetNull)
+  organizationId    String
+  organization      Organization  @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  createdAt         DateTime      @default(now())
+
+  @@index([reputationEntryId])
+  @@index([organizationId])
+  @@index([serverId])
+  @@index([passed])
+}
+
+// ==================================================================
+// POLICIES
+// ==================================================================
+
+model Policy {
+  id                    String  @id @default(uuid())
+
+  allowMaxScore         Int     @default(30)
+  rateLimitMaxScore     Int     @default(60)
+  challengeMaxScore     Int     @default(80)
+
+  enableJsChallenge     Boolean @default(true)
+  challengeAllVisitors  Boolean @default(true)
+  passTokenTtlMinutes   Int     @default(60)
+
+  rateLimitRequests     Int     @default(30)
+  rateLimitWindowSec    Int     @default(60)
+
+  maxRequestsPerIp      Int     @default(300)
+  maxRequestsWindowSec  Int     @default(60)
+  banOnMaxRequests      Boolean @default(true)
+  maxServerRps          Int?
+  capacityWarnPercent   Int     @default(80)
+
+  autoBanAfterFails     Int     @default(2)
+  temporaryBanMinutes   Int     @default(120)
+  advancedBanMinutes    Int     @default(1440)
+  permanentBanScore     Int     @default(9)
+
+  enableAiAnomaly       Boolean @default(true)
+  enableSurgeDetection  Boolean @default(true)
+
+  organizationId String       @unique
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
+
+// ==================================================================
+// NOTIFICATIONS
+// ==================================================================
+
+model Notification {
+  id          String           @id @default(uuid())
+  type        NotificationType
+  title       String
+  message     String
+  severity    Int              @default(1)
+  isRead      Boolean          @default(false)
+  metadata    Json?
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+
+  @@index([organizationId])
+  @@index([organizationId, isRead])
+  @@index([createdAt])
+}
+
+// ==================================================================
+// REPORTS
+// ==================================================================
+
+model Report {
+  id            String       @id @default(uuid())
+  title         String
+  status        ReportStatus @default(PENDING)
+  periodStart   DateTime
+  periodEnd     DateTime
+  content       String?
+  summary       String?
+  errorMessage  String?
+  eventCount    Int          @default(0)
+  blockedCount  Int          @default(0)
+  metadata      Json?
+
+  securityEventId String?
+  securityEvent   SecurityEvent? @relation(fields: [securityEventId], references: [id], onDelete: SetNull)
+
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([organizationId])
+  @@index([status])
+  @@index([securityEventId])
+}
+
+// ==================================================================
+// SIMULATION LAB
+// ==================================================================
+
+model SimulationRun {
+  id               String            @id @default(uuid())
+  pattern          SimulationPattern
+  status           SimulationStatus  @default(RUNNING)
+  targetRps        Int
+  durationSec      Int?
+  totalSent        Int               @default(0)
+  totalAllowed     Int               @default(0)
+  totalRateLimited Int               @default(0)
+  totalChallenged  Int               @default(0)
+  totalBlocked     Int               @default(0)
+
+  serverId       String
+  server         Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  organizationId String
+  organization   Organization @relation(fields: [organizationId], references: [id], onDelete: Cascade)
+
+  startedAt DateTime  @default(now())
+  stoppedAt DateTime?
+
+  @@index([organizationId])
+  @@index([serverId])
+  @@index([status])
+}
