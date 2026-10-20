@@ -8,13 +8,13 @@ import { z } from 'zod'
 export const updateOrganizationSchema = z
   .object({
     name: z
-      .string({ invalid_type_error: 'الاسم يجب أن يكون نص' })
+      .string({ message: 'الاسم يجب أن يكون نص' })
       .min(2, { message: 'اسم الشركة يجب أن يكون من حرفين على الأقل' })
       .max(100, { message: 'اسم الشركة طويل جدًا' })
       .optional(),
 
     slug: z
-      .string({ invalid_type_error: 'الـ slug يجب أن يكون نص' })
+      .string({ message: 'الـ slug يجب أن يكون نص' })
       .min(2, { message: 'الـ slug يجب أن يكون من حرفين على الأقل' })
       .max(100, { message: 'الـ slug طويل جدًا' })
       .regex(/^[a-z0-9]+(?:-[a-z0-9]+)*$/, {
