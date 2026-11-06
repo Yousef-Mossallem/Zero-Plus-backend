@@ -18,7 +18,7 @@
 // Gateway (X-Gateway-Key) → prefix: /internal/gateway
 //   GET  /servers                  مزامنة كل السيرفرات (cursor + updatedSince)
 //   GET  /servers/resolve?host=    سيرفر واحد من الـ Host
-//   POST /servers/:id/health       الـ Gateway يبلّغ بحالة السيرفر
+//   POST /servers/:id/health       الـ Gateway يبلّغ بحالة السيرفر (+ نتائج Probe)
 //
 // ملاحظة: متوافق مع Zod v3 و v4 (من غير required_error).
 // ==================================================================
@@ -83,12 +83,6 @@ function getPlatformDomains(): string[] {
 
 /**
  * توحيد الدومين + التحقق منه (للإنشاء والتعديل).
- *  - lowercase + إزالة النقطة الأخيرة
- *  - تحويل الدومينات غير الإنجليزية لـ punycode (نفس شكل الـ Host اللي بيوصل للـ Gateway)
- *  - رفض: URL / مسار / منفذ / wildcard / عنوان IP / underscore / نطاق محجوز
- *
- * لازم يتوافق مع HOST_REGEX بتاع policies.schema.ts
- * (الـ Gateway بيدوّر بنفس الشكل)
  */
 export function normalizeDomain(raw: string): DomainCheck {
   let value = raw.trim().toLowerCase()
@@ -119,7 +113,6 @@ export function normalizeDomain(raw: string): DomainCheck {
 
   if (!ascii) return fail('صيغة النطاق غير صحيحة')
 
-  // domainToASCII بيفسّر "0x7f.1" كـ 127.0.0.1، فده بيمسك الحيل دي كمان
   if (isIP(ascii)) return fail('النطاق لا يمكن أن يكون عنوان IP')
 
   if (ascii.length > 253) return fail('النطاق طويل جدًا')
@@ -155,9 +148,7 @@ export function normalizeDomain(raw: string): DomainCheck {
 }
 
 /**
- * توحيد الـ Host القادم من الـ Gateway أو من تأكيد الحذف:
- * أخف من normalizeDomain (بيشيل البورت، وما بيطبقش قواعد الحجز).
- * بيرجّع null لو الشكل غير صالح.
+ * توحيد الـ Host القادم من الـ Gateway أو من تأكيد الحذف.
  */
 export function normalizeHostHeader(raw: string): string | null {
   const host = raw
@@ -183,13 +174,6 @@ export function normalizeHostHeader(raw: string): string | null {
 
 export type IpClass = 'PUBLIC' | 'PRIVATE' | 'FORBIDDEN'
 
-/**
- * PUBLIC    عنوان عام ✅
- * PRIVATE   داخلي (10.x / 172.16-31.x / 192.168.x / 127.x / 100.64-127.x)
- *           مسموح في التطوير فقط (ALLOW_PRIVATE_ORIGINS)
- * FORBIDDEN مرفوض دايمًا: 0.x, Link-local وبيشمل Cloud Metadata
- *           (169.254.169.254), Multicast, Reserved, Broadcast
- */
 export function classifyIPv4(ip: string): IpClass {
   const [a, b] = ip.split('.').map(Number) as [number, number]
 
@@ -206,12 +190,6 @@ export function classifyIPv4(ip: string): IpClass {
   return 'PUBLIC'
 }
 
-/**
- * هل نسمح بعناوين داخلية؟
- *  ALLOW_PRIVATE_ORIGINS=true   → نعم
- *  ALLOW_PRIVATE_ORIGINS=false  → لا
- *  غير محدد                     → نعم في التطوير، ولا في الإنتاج
- */
 export function allowPrivateOrigins(): boolean {
   const flag = process.env.ALLOW_PRIVATE_ORIGINS
 
@@ -236,7 +214,6 @@ export function validateOriginIp(raw: string): OriginIpCheck {
     return { ok: false, message: 'IPv6 غير مدعوم حاليًا، استخدم عنوان IPv4' }
   }
 
-  // isIP بيرفض الأصفار البادئة (010.1.1.1) وبالتالي بيمنع غموض الـ octal
   if (version !== 4) {
     return { ok: false, message: 'صيغة عنوان IP غير صحيحة' }
   }
@@ -254,7 +231,8 @@ export function validateOriginIp(raw: string): OriginIpCheck {
   if (ipClass === 'PRIVATE' && !allowPrivateOrigins()) {
     return {
       ok: false,
-      message: 'يجب أن يكون الـ Origin عنوان IP عامًا (العناوين الداخلية غير مسموحة)',
+      message:
+        'يجب أن يكون الـ Origin عنوان IP عامًا (العناوين الداخلية غير مسموحة)',
     }
   }
 
@@ -265,7 +243,6 @@ export function validateOriginIp(raw: string): OriginIpCheck {
 // 4) المنفذ
 // ==================================================================
 
-// منافذ خدمات (قواعد بيانات / بريد / ...) مش المفروض الـ Gateway يبعتلها HTTP
 const BLOCKED_ORIGIN_PORTS: ReadonlySet<number> = new Set([
   22, 23, 25, 110, 143, 465, 587, 993, 995, 1433, 3306, 5432, 6379, 9200,
   11211, 27017,
@@ -312,7 +289,9 @@ const originPortField = z
     message: 'هذا المنفذ مخصص لخدمة غير ويب ولا يمكن استخدامه كـ Origin',
   })
 
-const sslEnabledField = z.boolean({ message: 'sslEnabled يجب أن يكون true أو false' })
+const sslEnabledField = z.boolean({
+  message: 'sslEnabled يجب أن يكون true أو false',
+})
 
 const modeField = z.enum(SERVER_MODES, {
   message: 'mode يجب أن يكون PROTECT أو MONITOR_ONLY',
@@ -327,12 +306,7 @@ export const createServerSchema = z
     domain: domainField,
     originIp: originIpField,
     originPort: originPortField.default(443),
-
-    // لو ما اتبعتش: false لو المنفذ 80، وإلا true
     sslEnabled: sslEnabledField.optional(),
-
-    // لو ما اتبعتش: القيمة الافتراضية في Prisma (PROTECT)
-    // الأنسب للشركات الجديدة تبدأ بـ MONITOR_ONLY (الفرونت يبعتها)
     mode: modeField.optional(),
   })
   .strict()
@@ -344,14 +318,6 @@ export const createServerSchema = z
 // ==================================================================
 // 7) تعديل سيرفر  (PATCH /servers/:id)
 // ==================================================================
-// ملاحظات للـ Service:
-//  - لو domain اتغير: صفّر dnsVerified / dnsVerifiedAt / gatewayReachable
-//    وولّد verificationToken جديد، وارجع status لـ PENDING.
-//  - لو originIp/originPort اتغيروا: صفّر originReachable وارجع PENDING.
-//  - حقول السعة (maxRequestsPerSecond, cpuCores, ...) مش قابلة للتعديل
-//    من المستخدم: بتتحدد من الـ Health Check، وسقف الشركة بيتحدد في
-//    Policy.maxServerRps.
-//  - status مش بيتعدل هنا (النظام بيحسبه)، والصيانة ليها endpoint خاص.
 
 export const updateServerSchema = z
   .object({
@@ -375,8 +341,6 @@ export const serverIdParamsSchema = z.object({
   id: z.string({ message: 'معرف السيرفر مطلوب' }).uuid('معرف السيرفر غير صالح'),
 })
 
-// ---- helpers للـ Query String ----
-
 const queryBoolean = z
   .enum(['true', 'false'], { message: 'القيمة يجب أن تكون true أو false' })
   .optional()
@@ -396,8 +360,6 @@ const queryInt = (fallback: number, min: number, max: number) =>
         .max(max, `القيمة يجب ألا تزيد عن ${max}`),
     )
 
-// ---- GET /servers ----
-
 export const listServersQuerySchema = z.object({
   page: queryInt(1, 1, 100_000),
   limit: queryInt(20, 1, 100),
@@ -406,7 +368,6 @@ export const listServersQuerySchema = z.object({
   mode: z.enum(SERVER_MODES).optional(),
   dnsVerified: queryBoolean,
 
-  // بحث في الدومين فقط
   search: z.string().trim().min(1).max(100).optional(),
 
   sortBy: z
@@ -414,12 +375,6 @@ export const listServersQuerySchema = z.object({
     .default('createdAt'),
   sortOrder: z.enum(['asc', 'desc']).default('desc'),
 })
-
-// ---- POST /servers/:id/verify ----
-// body اختياري. الـ Route تمرر: request.body ?? {}
-//   ownership → فحص TXT (إثبات ملكية الدومين) ← dnsVerified
-//   routing   → فحص إن الدومين بيشاور على الـ Gateway ← gatewayReachable
-//   all       → الاتنين (الافتراضي)
 
 export const VERIFY_STEPS = ['ownership', 'routing', 'all'] as const
 
@@ -429,17 +384,11 @@ export const verifyServerSchema = z
   })
   .strict()
 
-// ---- POST /servers/:id/maintenance ----
-
 export const maintenanceSchema = z
   .object({
     enabled: z.boolean({ message: 'enabled يجب أن يكون true أو false' }),
   })
   .strict()
-
-// ---- DELETE /servers/:id?confirmDomain=shop.example.com ----
-// حذف السيرفر بيحذف معاه كل الـ SecurityEvents والـ ChallengeLogs
-// (onDelete: Cascade)، فبنطلب كتابة الدومين للتأكيد.
 
 export const hostSchema = z
   .string({ message: 'host مطلوب' })
@@ -465,59 +414,68 @@ export const deleteServerQuerySchema = z.object({
 // 9) الـ Gateway
 // ==================================================================
 
-// ---- GET /internal/gateway/servers?limit=&cursor=&updatedSince= ----
-// مزامنة السيرفرات (تحميل كل السيرفرات عند تشغيل الـ Gateway، ثم التحديثات).
-// updatedSince: ISO بصيغة UTC تنتهي بـ Z (مثال: 2026-10-02T10:00:00.000Z)
-
 export const gatewayServersQuerySchema = z.object({
   limit: queryInt(500, 1, 1000),
   cursor: z.string().uuid('cursor غير صالح').optional(),
   updatedSince: z
     .string()
-    .datetime({ message: 'updatedSince يجب أن يكون تاريخ ISO بصيغة UTC (ينتهي بـ Z)' })
+    .datetime({
+      message: 'updatedSince يجب أن يكون تاريخ ISO بصيغة UTC (ينتهي بـ Z)',
+    })
     .optional(),
 })
-
-// ---- GET /internal/gateway/servers/resolve?host= ----
 
 export const gatewayServerResolveQuerySchema = z.object({
   host: hostSchema,
 })
 
 // ---- POST /internal/gateway/servers/:id/health ----
-// الـ Gateway هو اللي شايف الـ Origin فعليًا، فبيبلّغ بحالته.
-// الـ Service هو اللي يحسب status (ONLINE / DEGRADED / OFFLINE) من القيم دي.
+// يدعم تقارير الصحة العادية + نتائج Origin Probe الكاملة
+
+const probeStepSchema = z.object({
+  connections: z.number().int().min(1).max(2000),
+  rps: z.number().int().min(0),
+  p99Ms: z.number().int().min(0),
+  errorRate: z.number().min(0).max(100),
+})
 
 export const gatewayHealthReportSchema = z
   .object({
     originReachable: z.boolean().optional(),
-    // الـ Gateway استقبل طلب حقيقي على الدومين ده = الـ DNS متوجه صح
     gatewayReachable: z.boolean().optional(),
     avgResponseTimeMs: z.number().int().min(0).max(600_000).optional(),
+    p95ResponseTimeMs: z.number().int().min(0).max(600_000).optional(),
+    loadLatencyP99Ms: z.number().int().min(0).max(600_000).optional(),
     currentLoadPercent: z.number().min(0).max(100).optional(),
+    maxRequestsPerSecond: z.number().int().min(0).optional(),
+    safeRequestsPerSecond: z.number().int().min(0).optional(),
+    probeErrorRate: z.number().min(0).max(100).optional(),
+    probeConfidence: z.enum(['high', 'medium', 'low']).optional(),
+    probeRecommendation: z
+      .enum(['excellent', 'good', 'fair', 'poor', 'down'])
+      .optional(),
+    probeDetails: z
+      .object({
+        steps: z.array(probeStepSchema).max(20),
+        runs: z.array(z.object({ rps: z.number().int().min(0) })).max(10),
+        saturated: z.boolean().optional(),
+        redirected: z.boolean().optional(),
+      })
+      .optional(),
     lastError: z.string().trim().max(500).optional(),
   })
   .strict()
   .refine(
-    (data) =>
-      data.originReachable !== undefined ||
-      data.gatewayReachable !== undefined ||
-      data.avgResponseTimeMs !== undefined ||
-      data.currentLoadPercent !== undefined,
+    (d) =>
+      Object.entries(d).some(
+        ([k, v]) => k !== 'lastError' && v !== undefined,
+      ),
     { message: 'يجب إرسال قيمة صحة واحدة على الأقل' },
   )
 
 // ==================================================================
-// 10) إعدادات وتعليمات الـ DNS (الشركة تعمل إيه عشان الترافيك يعدي علينا)
+// 10) إعدادات وتعليمات الـ DNS
 // ==================================================================
-// الفكرة: السيرفر الجديد لازم يتربط بخدمة الـ DNS بتاعة الشركة في خطوتين:
-//   1) سجل TXT يثبت إنها مالكة الدومين        → dnsVerified
-//   2) توجيه الدومين للـ Gateway (CNAME أو A)  → gatewayReachable
-// وبعدها الترافيك بيعدي على الـ Gateway وبعدين الـ Origin.
-//
-// في .env:
-//   GATEWAY_CNAME_TARGET=edge.zeroplus.app
-//   GATEWAY_PUBLIC_IPS=203.0.113.10,203.0.113.11
 
 export const DNS_TXT_LABEL = '_zeroplus-verify'
 export const DNS_TXT_VALUE_PREFIX = 'zeroplus-verify='
@@ -541,7 +499,8 @@ export function readDnsConfig(env: NodeJS.ProcessEnv = process.env): DnsConfig {
 }
 
 export const dnsTxtRecordName = (domain: string) => `${DNS_TXT_LABEL}.${domain}`
-export const dnsTxtRecordValue = (token: string) => `${DNS_TXT_VALUE_PREFIX}${token}`
+export const dnsTxtRecordValue = (token: string) =>
+  `${DNS_TXT_VALUE_PREFIX}${token}`
 
 export interface DnsRecordInstruction {
   purpose: 'OWNERSHIP' | 'ROUTING'
@@ -555,7 +514,6 @@ export interface DnsRecordInstruction {
 export interface DnsInstructions {
   domain: string
   ownership: DnsRecordInstruction
-  /** اختار سجل واحد منهم (CNAME للدومين الفرعي، أو A للدومين الرئيسي) */
   routing: DnsRecordInstruction[]
   steps: string[]
   warnings: string[]
@@ -601,8 +559,8 @@ export function buildDnsInstructions(
   }
 
   const warnings: string[] = [
-    'احذف أي سجل A/CNAME قديم للدومين ده قبل إضافة سجل التوجيه، وإلا الترافيك هيفضل رايح للسيرفر الأصلي من غير حماية.',
-    'بعد التفعيل، اقفل السيرفر الأصلي على عناوين الـ Gateway فقط (Firewall). لو الـ IP الأصلي معروف للمهاجم هيهاجمه مباشرة ويتخطى الحماية.',
+    'Delete any old A/CNAME record for this domain before adding the routing record, otherwise traffic will keep going straight to the origin server without protection.',
+    'After activation, lock down the origin server to the Gateway addresses only (Firewall). If the attacker knows the origin IP, they will attack it directly and bypass the protection.',
   ]
 
   if (routing.length === 0) {
@@ -610,17 +568,16 @@ export function buildDnsInstructions(
       'إعدادات توجيه الـ Gateway (GATEWAY_CNAME_TARGET / GATEWAY_PUBLIC_IPS) غير مضبوطة في السيرفر.',
     )
   }
-
   return {
     domain,
     ownership,
     routing,
     steps: [
-      'أضف سجل TXT للتحقق من ملكية الدومين في لوحة الـ DNS عندك.',
-      'اضغط "تحقق" (step: ownership) بعد انتشار السجل (قد يستغرق دقائق).',
-      'وجّه الدومين للـ Gateway بسجل CNAME أو A (واحد منهم فقط).',
-      'اضغط "تحقق" (step: routing). لو نجح الترافيك بدأ يعدي على الحماية.',
-      'ابدأ بوضع MONITOR_ONLY لمراقبة القرارات، وبعدها حوّل لـ PROTECT.',
+      'Add a TXT record to verify domain ownership in your DNS panel.',
+      'Click "Verify" (step: ownership) after the record has propagated (it may take a few minutes).',
+      'Point the domain to the Gateway using a CNAME or A record (only one of them).',
+      'Click "Verify" (step: routing). If it succeeds, traffic will start flowing through the protection.',
+      'Start with MONITOR_ONLY mode to observe decisions, then switch to PROTECT.',
     ],
     warnings,
   }
@@ -632,9 +589,7 @@ export function buildDnsInstructions(
 
 export interface DnsCheckResult {
   verified: boolean
-  /** القيم المتوقعة في الـ DNS */
   expected: string[]
-  /** القيم اللي لقيناها فعلًا */
   found: string[]
   checkedAt: string
   message: string
@@ -665,14 +620,14 @@ export interface GatewayServerPayload {
   gatewayReachable: boolean
   originReachable: boolean
   maxRequestsPerSecond: number | null
+  /** رقم التسعير الآمن من آخر Probe */
+  safeRequestsPerSecond: number | null
   updatedAt: string
 }
 
 export interface GatewayServersListResult {
   servers: GatewayServerPayload[]
-  /** null = خلصت القائمة */
   nextCursor: string | null
-  /** وقت السيرفر: استخدمه كـ updatedSince في المزامنة الجاية */
   serverTime: string
 }
 

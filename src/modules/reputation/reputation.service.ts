@@ -1,24 +1,13 @@
 // backend/src/modules/reputation/reputation.service.ts
 // ==================================================================
 // Zero Plus - Reputation Service
-// ------------------------------------------------------------------
-// السمعة الذكية: الـ Gateway يبعت أدلة (signals) والباك يحسب النقاط
-// حسب (نوع الدليل × الخطورة × التأكد × التكرار × تاريخ المعتدي)،
-// ويطبق Policy الشركة في الحظر، ويخفض السمعة تدريجيًا مع الوقت.
-//
-// قواعد أساسية:
-//   1) Lazy: السجل بيتنشئ فقط عند دليل سلبي أو فشل اختبار (الزائر النضيف ما بيتخزنش)
-//   2) الحظر المؤقت/الدائم بيطلع من Policy الشركة فقط (الـ Gateway ما يفرضش حظر)
-//   3) الجهاز الموثوق (isAllowlisted) ما بيتحظرش ولا بتتغير سمعته
-//   4) المطابقة بالبصمة بتستخدم deviceFingerprint فقط (JA3/JA4 بتتشارك بين
-//      ملايين المتصفحات فمش مناسبة للحظر، بتتخزن للتحليل بس)
-//   5) كل عملية معزولة بـ organizationId، والعمليات اليدوية بتسجل Notification
-//   6) منع تكرار الأدلة (dedupe) وidempotencyKey في الذاكرة: بيتصفّر مع
-//      إعادة التشغيل وغير مشترك بين أكتر من instance (للـ production: Redis)
+// + Socket.IO: reputation:update للداشبورد عند تغيّر مهم
 // ==================================================================
 
 import { Prisma, type BanStatus, type ReputationEntry } from '@prisma/client'
 import type { FastifyInstance } from 'fastify'
+
+import { SocketEvents } from '../../plugins/socket.plugin.js'
 
 import {
   REPUTATION_TUNING,
@@ -80,9 +69,7 @@ interface OrgContext {
   policy: PolicySnapshot
 }
 
-/** أقصى عدد فشل بيتحسب في تقرير واحد (يمنع حظر فوري من تقرير واحد مليان أدلة) */
 const MAX_FAILED_PER_REPORT = 2
-/** عتبة إشعار "سمعة حرجة" */
 const CRITICAL_SCORE = 8
 const MAX_TX_ATTEMPTS = 3
 const IDEMPOTENCY_TTL_MS = 10 * 60_000
@@ -111,7 +98,6 @@ export class ReputationServiceError extends Error {
   }
 }
 
-/** مين عمل الإجراء اليدوي (للـ Audit) */
 export interface ReputationActor {
   userId: string
   email?: string
@@ -146,28 +132,59 @@ export interface ListChallengesResult {
 
 export interface ManualActionResult {
   entry: ReputationEntryPublic
-  /** false = الحالة المطلوبة كانت موجودة أصلًا (ما اتعملش تغيير) */
   changed: boolean
 }
 
+/** Payload لحظي للداشبورد */
+export interface ReputationRealtimePayload {
+  id: string
+  organizationId: string
+  ipAddress: string
+  deviceFingerprint: string | null
+  score: number
+  scoreBand: ScoreBand
+  banStatus: BanStatus
+  bannedUntil: string | null
+  isAllowlisted: boolean
+  isManualBan: boolean
+  isKnownBotnet: boolean
+  failedChecksCount: number
+  action:
+    | 'manual_ban'
+    | 'unban'
+    | 'allowlist'
+    | 'reset'
+    | 'auto_ban'
+    | 'escalated'
+    | 'critical_score'
+    | 'updated'
+  updatedAt: string
+}
+
 // ==================================================================
-// Helpers (دوال صرفة)
+// Helpers
 // ==================================================================
 
 const round2 = (value: number) => Math.round(value * 100) / 100
-const clampScore = (value: number) => Math.min(10, Math.max(1, Math.round(value)))
+const clampScore = (value: number) =>
+  Math.min(10, Math.max(1, Math.round(value)))
 
 function isPrismaError(
   error: unknown,
   code: string,
 ): error is Prisma.PrismaClientKnownRequestError {
   return (
-    error instanceof Prisma.PrismaClientKnownRequestError && error.code === code
+    error instanceof Prisma.PrismaClientKnownRequestError &&
+    error.code === code
   )
 }
 
 const notFound = () =>
-  new ReputationServiceError('سجل السمعة غير موجود', 404, 'REPUTATION_NOT_FOUND')
+  new ReputationServiceError(
+    'سجل السمعة غير موجود',
+    404,
+    'REPUTATION_NOT_FOUND',
+  )
 
 export function toPublic(entry: ReputationEntry): ReputationEntryPublic {
   return {
@@ -204,13 +221,28 @@ export function toPublic(entry: ReputationEntry): ReputationEntryPublic {
   }
 }
 
-/**
- * تقادم السمعة: كل DECAY_AFTER_HOURS ساعة من غير أدلة سلبية = تخفيض نقطة
- * (وبينزل معاها عداد الفشل، فمحدش يتحظر بسبب فشلين بينهم شهرين).
- * ما بيتطبقش على: الحظر الدائم / اليدوي / البوت نت المعروف / الجهاز الموثوق /
- * الحظر المؤقت الساري.
- * anchor = نقطة البداية الجديدة (بتتقدم عشان نفس المدة ما تتحسبش مرتين).
- */
+function toRealtimePayload(
+  entry: ReputationEntryPublic,
+  action: ReputationRealtimePayload['action'],
+): ReputationRealtimePayload {
+  return {
+    id: entry.id,
+    organizationId: entry.organizationId,
+    ipAddress: entry.ipAddress,
+    deviceFingerprint: entry.deviceFingerprint,
+    score: entry.score,
+    scoreBand: entry.scoreBand,
+    banStatus: entry.banStatus,
+    bannedUntil: entry.bannedUntil,
+    isAllowlisted: entry.isAllowlisted,
+    isManualBan: entry.isManualBan,
+    isKnownBotnet: entry.isKnownBotnet,
+    failedChecksCount: entry.failedChecksCount,
+    action,
+    updatedAt: entry.updatedAt,
+  }
+}
+
 function computeDecay(entry: ReputationEntry, now: Date) {
   const none = {
     steps: 0,
@@ -258,7 +290,6 @@ const SEVERITY_ORDER: Record<Severity, number> = {
   CRITICAL: 3,
 }
 
-/** دمج الأدلة المكررة من نفس النوع في نفس التقرير */
 function mergeSignals(
   signals: ApplyReputationInput['signals'],
 ): Array<SignalInput & { note?: string }> {
@@ -310,10 +341,12 @@ function describeSignals(signals: SignalInput[]): string {
   return labels.length > 0 ? labels.join('، ') : 'أدلة سلبية متراكمة'
 }
 
-// ---- ذاكرة منع التكرار (key → وقت الانتهاء) ----
 const signalSeen = new Map<string, number>()
 const idempotencySeen = new Map<string, number>()
-const orgActiveCache = new Map<string, { active: boolean; expiresAt: number }>()
+const orgActiveCache = new Map<
+  string,
+  { active: boolean; expiresAt: number }
+>()
 
 function isFresh(map: Map<string, number>, key: string, nowMs: number) {
   const expiresAt = map.get(key)
@@ -322,7 +355,6 @@ function isFresh(map: Map<string, number>, key: string, nowMs: number) {
 
 function prune(map: Map<string, number>, nowMs: number) {
   if (map.size < 5000) return
-
   for (const [key, expiresAt] of map) {
     if (expiresAt <= nowMs) map.delete(key)
   }
@@ -336,16 +368,62 @@ export class ReputationService {
   constructor(private readonly fastify: FastifyInstance) {}
 
   // ================================================================
+  // Socket
+  // ================================================================
+
+  private emitReputationUpdate(payload: ReputationRealtimePayload) {
+    try {
+      if (typeof this.fastify.broadcastToOrg === 'function') {
+        this.fastify.broadcastToOrg(
+          payload.organizationId,
+          SocketEvents.REPUTATION_UPDATE,
+          payload,
+        )
+      }
+    } catch (err) {
+      this.fastify.log.warn(
+        { err, id: payload.id },
+        'Failed to broadcast reputation:update',
+      )
+    }
+  }
+
+  /** بعد apply: بث عند تحوّل مهم فقط */
+  private maybeEmitAfterApply(result: ApplyReputationResult) {
+    if (!result.applied || !result.entry || !result.change) return
+
+    const { change, entry } = result
+
+    if (change.newlyBanned) {
+      this.emitReputationUpdate(toRealtimePayload(entry, 'auto_ban'))
+      return
+    }
+
+    if (
+      change.banStatusBefore === 'TEMPORARY' &&
+      change.banStatusAfter === 'PERMANENT'
+    ) {
+      this.emitReputationUpdate(toRealtimePayload(entry, 'escalated'))
+      return
+    }
+
+    if (
+      change.scoreAfter >= CRITICAL_SCORE &&
+      change.scoreBefore < CRITICAL_SCORE
+    ) {
+      this.emitReputationUpdate(toRealtimePayload(entry, 'critical_score'))
+    }
+  }
+
+  // ================================================================
   // Private: سياق الشركة والـ Policy
   // ================================================================
 
-  /** شركة موجودة ونشطة + الـ Policy بتاعتها (استعلام واحد) */
   private async getOrgContext(
     organizationId: string,
     cache?: Map<string, OrgContext>,
   ): Promise<OrgContext> {
     const hit = cache?.get(organizationId)
-
     if (hit) return hit
 
     const org = await this.fastify.prisma.organization.findUnique({
@@ -382,13 +460,10 @@ export class ReputationService {
     const ctx: OrgContext = {
       policy: { ...DEFAULT_POLICY, ...(org.policy ?? {}) },
     }
-
     cache?.set(organizationId, ctx)
-
     return ctx
   }
 
-  /** للـ lookup (مسار ساخن): كاش 30 ثانية لفحص التفعيل فقط */
   private async assertOrgActiveCached(organizationId: string) {
     const nowMs = Date.now()
     const hit = orgActiveCache.get(organizationId)
@@ -441,7 +516,6 @@ export class ReputationService {
         banOnMaxRequests: true,
       },
     })
-
     return { ...DEFAULT_POLICY, ...(policy ?? {}) }
   }
 
@@ -454,11 +528,9 @@ export class ReputationService {
           isolationLevel: Prisma.TransactionIsolationLevel.Serializable,
         })
       } catch (error) {
-        // P2034: تعارض Transactions | P2002: سباق إنشاء نفس السجل
-        const retryable = isPrismaError(error, 'P2034') || isPrismaError(error, 'P2002')
-
+        const retryable =
+          isPrismaError(error, 'P2034') || isPrismaError(error, 'P2002')
         if (retryable && attempt < MAX_TX_ATTEMPTS) continue
-
         if (retryable) {
           throw new ReputationServiceError(
             'حصل تعارض أثناء حفظ السمعة، حاول مرة أخرى',
@@ -466,7 +538,6 @@ export class ReputationService {
             'CONFLICT',
           )
         }
-
         throw error
       }
     }
@@ -478,12 +549,9 @@ export class ReputationService {
     id: string,
   ): Promise<ReputationEntry> {
     const entry = await db.reputationEntry.findFirst({
-      // organizationId جزء أساسي: ما ينفعش حد يوصل لسجل شركة تانية
       where: { id, organizationId },
     })
-
     if (!entry) throw notFound()
-
     return entry
   }
 
@@ -518,7 +586,6 @@ export class ReputationService {
     const now = new Date()
     const and: Prisma.ReputationEntryWhereInput[] = []
 
-    // الحظر المؤقت المنتهي بيتحسب NONE (من غير ما ننتظر تنظيف)
     if (query.banStatus === 'PERMANENT') {
       and.push({ banStatus: 'PERMANENT' })
     } else if (query.banStatus === 'TEMPORARY') {
@@ -537,7 +604,12 @@ export class ReputationService {
       and.push({
         OR: [
           { ipAddress: { contains: query.search, mode: 'insensitive' } },
-          { deviceFingerprint: { contains: query.search, mode: 'insensitive' } },
+          {
+            deviceFingerprint: {
+              contains: query.search,
+              mode: 'insensitive',
+            },
+          },
         ],
       })
     }
@@ -548,9 +620,15 @@ export class ReputationService {
       ...(query.ipType && { ipType: query.ipType }),
       ...(query.countryCode && { countryCode: query.countryCode }),
       ...(query.asn !== undefined && { asn: query.asn }),
-      ...(query.isAllowlisted !== undefined && { isAllowlisted: query.isAllowlisted }),
-      ...(query.isManualBan !== undefined && { isManualBan: query.isManualBan }),
-      ...(query.isKnownBotnet !== undefined && { isKnownBotnet: query.isKnownBotnet }),
+      ...(query.isAllowlisted !== undefined && {
+        isAllowlisted: query.isAllowlisted,
+      }),
+      ...(query.isManualBan !== undefined && {
+        isManualBan: query.isManualBan,
+      }),
+      ...(query.isKnownBotnet !== undefined && {
+        isKnownBotnet: query.isKnownBotnet,
+      }),
       ...((query.minScore !== undefined || query.maxScore !== undefined) && {
         score: {
           ...(query.minScore !== undefined && { gte: query.minScore }),
@@ -559,8 +637,12 @@ export class ReputationService {
       }),
       ...((query.lastSeenAfter || query.lastSeenBefore) && {
         lastSeenAt: {
-          ...(query.lastSeenAfter && { gte: new Date(query.lastSeenAfter) }),
-          ...(query.lastSeenBefore && { lte: new Date(query.lastSeenBefore) }),
+          ...(query.lastSeenAfter && {
+            gte: new Date(query.lastSeenAfter),
+          }),
+          ...(query.lastSeenBefore && {
+            lte: new Date(query.lastSeenBefore),
+          }),
         },
       }),
     }
@@ -570,7 +652,9 @@ export class ReputationService {
       this.fastify.prisma.reputationEntry.findMany({
         where,
         orderBy: [
-          { [query.sortBy]: query.sortOrder } as Prisma.ReputationEntryOrderByWithRelationInput,
+          {
+            [query.sortBy]: query.sortOrder,
+          } as Prisma.ReputationEntryOrderByWithRelationInput,
           { id: 'asc' },
         ],
         skip: (query.page - 1) * query.limit,
@@ -597,7 +681,9 @@ export class ReputationService {
     organizationId: string,
     id: string,
   ): Promise<ReputationEntryPublic> {
-    return toPublic(await this.findOwned(this.fastify.prisma, organizationId, id))
+    return toPublic(
+      await this.findOwned(this.fastify.prisma, organizationId, id),
+    )
   }
 
   async listChallenges(
@@ -664,16 +750,32 @@ export class ReputationService {
       critical,
     ] = await db.$transaction([
       db.reputationEntry.count({ where: base }),
-      db.reputationEntry.count({ where: { ...base, banStatus: 'PERMANENT' } }),
       db.reputationEntry.count({
-        where: { ...base, banStatus: 'TEMPORARY', bannedUntil: { gt: now } },
+        where: { ...base, banStatus: 'PERMANENT' },
       }),
-      db.reputationEntry.count({ where: { ...base, isAllowlisted: true } }),
-      db.reputationEntry.count({ where: { ...base, isKnownBotnet: true } }),
+      db.reputationEntry.count({
+        where: {
+          ...base,
+          banStatus: 'TEMPORARY',
+          bannedUntil: { gt: now },
+        },
+      }),
+      db.reputationEntry.count({
+        where: { ...base, isAllowlisted: true },
+      }),
+      db.reputationEntry.count({
+        where: { ...base, isKnownBotnet: true },
+      }),
       db.reputationEntry.count({ where: { ...base, score: { lte: 1 } } }),
-      db.reputationEntry.count({ where: { ...base, score: { gte: 2, lte: 3 } } }),
-      db.reputationEntry.count({ where: { ...base, score: { gte: 4, lte: 6 } } }),
-      db.reputationEntry.count({ where: { ...base, score: { gte: 7, lte: 8 } } }),
+      db.reputationEntry.count({
+        where: { ...base, score: { gte: 2, lte: 3 } },
+      }),
+      db.reputationEntry.count({
+        where: { ...base, score: { gte: 4, lte: 6 } },
+      }),
+      db.reputationEntry.count({
+        where: { ...base, score: { gte: 7, lte: 8 } },
+      }),
       db.reputationEntry.count({ where: { ...base, score: { gte: 9 } } }),
     ])
 
@@ -699,7 +801,7 @@ export class ReputationService {
   }
 
   // ================================================================
-  // Dashboard: إجراءات يدوية
+  // Dashboard: إجراءات يدوية (+ Socket بعد النجاح)
   // ================================================================
 
   async manualBan(
@@ -710,7 +812,7 @@ export class ReputationService {
   ): Promise<ManualActionResult> {
     const policy = await this.loadPolicy(organizationId)
 
-    return this.fastify.prisma.$transaction(async (tx) => {
+    const outcome = await this.fastify.prisma.$transaction(async (tx) => {
       const entry = await this.findOwned(tx, organizationId, id)
 
       if (entry.isAllowlisted) {
@@ -765,6 +867,14 @@ export class ReputationService {
 
       return { entry: toPublic(updated), changed: true }
     })
+
+    if (outcome.changed) {
+      this.emitReputationUpdate(
+        toRealtimePayload(outcome.entry, 'manual_ban'),
+      )
+    }
+
+    return outcome
   }
 
   async unban(
@@ -775,15 +885,13 @@ export class ReputationService {
   ): Promise<ManualActionResult> {
     const policy = await this.loadPolicy(organizationId)
 
-    return this.fastify.prisma.$transaction(async (tx) => {
+    const outcome = await this.fastify.prisma.$transaction(async (tx) => {
       const entry = await this.findOwned(tx, organizationId, id)
 
       if (entry.banStatus === 'NONE' && !input.resetScore) {
         return { entry: toPublic(entry), changed: false }
       }
 
-      // من غير resetScore: نخلي السمعة تحت عتبة الحظر الدائم والفشل تحت عتبة
-      // الحظر التلقائي، وإلا أول دليل جديد هيحظره فورًا تاني
       const updated = await tx.reputationEntry.update({
         where: { id },
         data: {
@@ -823,6 +931,12 @@ export class ReputationService {
 
       return { entry: toPublic(updated), changed: true }
     })
+
+    if (outcome.changed) {
+      this.emitReputationUpdate(toRealtimePayload(outcome.entry, 'unban'))
+    }
+
+    return outcome
   }
 
   async setAllowlist(
@@ -831,14 +945,13 @@ export class ReputationService {
     input: AllowlistInput,
     actor: ReputationActor,
   ): Promise<ManualActionResult> {
-    return this.fastify.prisma.$transaction(async (tx) => {
+    const outcome = await this.fastify.prisma.$transaction(async (tx) => {
       const entry = await this.findOwned(tx, organizationId, id)
 
       if (entry.isAllowlisted === input.enabled) {
         return { entry: toPublic(entry), changed: false }
       }
 
-      // الثقة بترفع الحظر الحالي وبتمنع أي حظر جاي
       const updated = await tx.reputationEntry.update({
         where: { id },
         data: input.enabled
@@ -870,6 +983,14 @@ export class ReputationService {
 
       return { entry: toPublic(updated), changed: true }
     })
+
+    if (outcome.changed) {
+      this.emitReputationUpdate(
+        toRealtimePayload(outcome.entry, 'allowlist'),
+      )
+    }
+
+    return outcome
   }
 
   async resetReputation(
@@ -878,7 +999,7 @@ export class ReputationService {
     input: ResetReputationInput,
     actor: ReputationActor,
   ): Promise<ManualActionResult> {
-    return this.fastify.prisma.$transaction(async (tx) => {
+    const outcome = await this.fastify.prisma.$transaction(async (tx) => {
       const entry = await this.findOwned(tx, organizationId, id)
 
       const updated = await tx.reputationEntry.update({
@@ -914,18 +1035,18 @@ export class ReputationService {
 
       return { entry: toPublic(updated), changed: true }
     })
+
+    if (outcome.changed) {
+      this.emitReputationUpdate(toRealtimePayload(outcome.entry, 'reset'))
+    }
+
+    return outcome
   }
 
   // ================================================================
-  // Gateway: LOOKUP (قبل القرار)
+  // Gateway: LOOKUP
   // ================================================================
 
-  /**
-   * الترتيب: سجل الـ IP أولًا، وبعدين deviceFingerprint (جهاز غيّر الـ IP).
-   * لو الـ IP نضيف لكن نفس الجهاز محظور عندنا ← بنرجّع حظر الجهاز.
-   * الجهاز الموثوق على الـ IP ليه الأولوية.
-   * السمعة المرجّعة بعد التقادم (قراءة فقط، من غير كتابة).
-   */
   async lookup(query: LookupReputationQuery): Promise<LookupReputationResult> {
     await this.assertOrgActiveCached(query.organizationId)
 
@@ -962,7 +1083,11 @@ export class ReputationService {
         chosen = deviceEntry
         matchedBy = 'DEVICE_FINGERPRINT'
       } else {
-        const ipBan = resolveEffectiveBan(ipEntry.banStatus, ipEntry.bannedUntil, now)
+        const ipBan = resolveEffectiveBan(
+          ipEntry.banStatus,
+          ipEntry.bannedUntil,
+          now,
+        )
         const deviceBan = resolveEffectiveBan(
           deviceEntry.banStatus,
           deviceEntry.bannedUntil,
@@ -997,10 +1122,10 @@ export class ReputationService {
       }
     }
 
-    // تنظيف الحظر المؤقت المنتهي (بيرفع updatedAt فالـ Gateway يشيله من الـ Redis)
     if (
       chosen.banStatus === 'TEMPORARY' &&
-      !resolveEffectiveBan(chosen.banStatus, chosen.bannedUntil, now).isCurrentlyBanned
+      !resolveEffectiveBan(chosen.banStatus, chosen.bannedUntil, now)
+        .isCurrentlyBanned
     ) {
       await db.reputationEntry.updateMany({
         where: {
@@ -1016,7 +1141,6 @@ export class ReputationService {
           isManualBan: false,
         },
       })
-
       chosen = { ...chosen, banStatus: 'NONE', bannedUntil: null }
     }
 
@@ -1024,7 +1148,11 @@ export class ReputationService {
     const effectiveScore = Math.max(1, chosen.score - decay.scorePoints)
 
     const ban = chosen.isAllowlisted
-      ? { banStatusEffective: 'NONE' as BanStatus, isCurrentlyBanned: false, minutesLeftOnBan: null }
+      ? {
+          banStatusEffective: 'NONE' as BanStatus,
+          isCurrentlyBanned: false,
+          minutesLeftOnBan: null,
+        }
       : resolveEffectiveBan(chosen.banStatus, chosen.bannedUntil, now)
 
     return {
@@ -1053,7 +1181,7 @@ export class ReputationService {
   }
 
   // ================================================================
-  // Gateway: APPLY (تسجيل الأدلة)
+  // Gateway: APPLY
   // ================================================================
 
   async apply(input: ApplyReputationInput): Promise<ApplyReputationResult> {
@@ -1068,14 +1196,11 @@ export class ReputationService {
     let succeeded = 0
     let newlyBanned = 0
 
-    // بالتتابع: تقريران لنفس الـ IP في نفس الدفعة ما يتعارضوش
     for (const [index, report] of input.reports.entries()) {
       try {
         const result = await this.applyWithCache(report, cache)
-
         results.push({ index, ok: true, result })
         succeeded++
-
         if (result.change?.newlyBanned) newlyBanned++
       } catch (error) {
         if (error instanceof ReputationServiceError) {
@@ -1086,7 +1211,10 @@ export class ReputationService {
             message: error.message,
           })
         } else {
-          this.fastify.log.error({ err: error, index }, 'Reputation batch item failed')
+          this.fastify.log.error(
+            { err: error, index },
+            'Reputation batch item failed',
+          )
           results.push({
             index,
             ok: false,
@@ -1132,14 +1260,15 @@ export class ReputationService {
       }
     }
 
-    // ---- Idempotency: نفس التقرير اتبعت قبل كده ----
     const idemKey = input.idempotencyKey
       ? `${organizationId}:${input.idempotencyKey}`
       : null
 
     if (idemKey && isFresh(idempotencySeen, idemKey, nowMs)) {
       const existing = await this.fastify.prisma.reputationEntry.findUnique({
-        where: { organizationId_ipAddress: { organizationId, ipAddress } },
+        where: {
+          organizationId_ipAddress: { organizationId, ipAddress },
+        },
       })
 
       return {
@@ -1153,21 +1282,17 @@ export class ReputationService {
       this.applyInTransaction(tx, input, ctx.policy),
     )
 
-    // علامات منع التكرار بتتسجل بعد نجاح الـ Transaction بس
     for (const mark of marks) signalSeen.set(mark.key, mark.expiresAt)
-
     if (idemKey) idempotencySeen.set(idemKey, nowMs + IDEMPOTENCY_TTL_MS)
-
     prune(signalSeen, nowMs)
     prune(idempotencySeen, nowMs)
+
+    // بعد الـ commit فقط
+    this.maybeEmitAfterApply(result)
 
     return result
   }
 
-  /**
-   * القلب: بيحسب كل حاجة جوه Transaction واحدة.
-   * بيتنفّذ تاني لو الـ Transaction اتعاد، فمفيش side effects برا (العلامات بترجع كقيمة).
-   */
   private async applyInTransaction(
     tx: Prisma.TransactionClient,
     input: ApplyReputationInput,
@@ -1182,16 +1307,18 @@ export class ReputationService {
     const marks: Array<{ key: string; expiresAt: number }> = []
 
     const existing = await tx.reputationEntry.findUnique({
-      where: { organizationId_ipAddress: { organizationId, ipAddress } },
+      where: {
+        organizationId_ipAddress: { organizationId, ipAddress },
+      },
     })
 
-    // ---- 1) الأدلة بعد الدمج ومنع التكرار ----
     const candidates: SignalInput[] = mergeSignals(input.signals)
 
-    // الباك بيولّد دليل الاختبار بنفسه من نتيجته
     if (input.challenge) {
       candidates.push({
-        type: input.challenge.passed ? 'CHALLENGE_PASSED' : 'CHALLENGE_FAILED',
+        type: input.challenge.passed
+          ? 'CHALLENGE_PASSED'
+          : 'CHALLENGE_FAILED',
         severity: 'MEDIUM',
         confidence: 1,
         count: 1,
@@ -1210,8 +1337,10 @@ export class ReputationService {
           dedupedTypes.push(signal.type)
           continue
         }
-
-        marks.push({ key, expiresAt: nowMs + def.dedupeWindowSec * 1000 })
+        marks.push({
+          key,
+          expiresAt: nowMs + def.dedupeWindowSec * 1000,
+        })
       }
 
       accepted.push(signal)
@@ -1219,7 +1348,6 @@ export class ReputationService {
 
     const rawBase = pointsFromSignals(accepted).raw
 
-    // ---- 2) Lazy: زائر ملوش سجل وملوش دليل سلبي = لا شيء ----
     if (!existing && rawBase <= 0) {
       return {
         result: { applied: false, entry: null, change: null },
@@ -1229,7 +1357,6 @@ export class ReputationService {
 
     const enrichment = this.buildEnrichment(input)
 
-    // ---- 3) جهاز موثوق: عدادات فقط، من غير سمعة ولا حظر ----
     if (existing?.isAllowlisted) {
       const saved = await tx.reputationEntry.update({
         where: { id: existing.id },
@@ -1268,7 +1395,6 @@ export class ReputationService {
       }
     }
 
-    // ---- 4) نقطة البداية: تقادم السجل القديم / وراثة من نفس الجهاز ----
     let scoreBase = 1
     let failedBase = 0
     let inheritedBotnet = false
@@ -1278,7 +1404,6 @@ export class ReputationService {
       scoreBase = existing.score - (decay?.scorePoints ?? 0)
       failedBase = decay?.failedAfter ?? existing.failedChecksCount
     } else if (input.deviceFingerprint) {
-      // جهاز معروف بسوء السمعة ظهر بعنوان جديد: يبدأ من سمعته السابقة (أقل بنقطة)
       const sameDevice = await tx.reputationEntry.findFirst({
         where: {
           organizationId,
@@ -1295,7 +1420,6 @@ export class ReputationService {
       }
     }
 
-    // ---- 5) النقاط: الوزن × الخطورة × التأكد × التكرار × تاريخ المعتدي ----
     const factor = rawBase > 0 ? repeatOffenderFactor(failedBase) : 1
     const pointsRaw = round2(pointsFromSignals(accepted).raw * factor)
 
@@ -1316,12 +1440,13 @@ export class ReputationService {
 
     const failedInc = Math.min(MAX_FAILED_PER_REPORT, failedSignals)
     const failedAfter = failedBase + failedInc
-    const successInc = accepted.some((s) => s.type === 'CHALLENGE_PASSED') ? 1 : 0
+    const successInc = accepted.some((s) => s.type === 'CHALLENGE_PASSED')
+      ? 1
+      : 0
 
     const scoreBefore = existing?.score ?? 1
     const scoreAfter = clampScore(scoreBase + pointsApplied)
 
-    // ---- 6) الحظر (من Policy الشركة فقط) ----
     const banBefore = existing
       ? resolveEffectiveBan(existing.banStatus, existing.bannedUntil, now)
       : null
@@ -1329,32 +1454,37 @@ export class ReputationService {
     let banStatus: BanStatus = banBefore?.banStatusEffective ?? 'NONE'
     let bannedUntil: Date | null =
       banStatus === 'TEMPORARY' ? (existing?.bannedUntil ?? null) : null
-    let bannedAt: Date | null = banStatus !== 'NONE' ? (existing?.bannedAt ?? null) : null
-    let banReason: string | null = banStatus !== 'NONE' ? (existing?.banReason ?? null) : null
-    let isManualBan = banStatus !== 'NONE' ? (existing?.isManualBan ?? false) : false
+    let bannedAt: Date | null =
+      banStatus !== 'NONE' ? (existing?.bannedAt ?? null) : null
+    let banReason: string | null =
+      banStatus !== 'NONE' ? (existing?.banReason ?? null) : null
+    let isManualBan =
+      banStatus !== 'NONE' ? (existing?.isManualBan ?? false) : false
 
     const reasonText = describeSignals(accepted)
     const hardLimitHit = accepted.some(
-      (s) => s.type === 'HARD_LIMIT_EXCEEDED' && computeSignalPoints(s) > 0,
+      (s) =>
+        s.type === 'HARD_LIMIT_EXCEEDED' && computeSignalPoints(s) > 0,
     )
 
     if (banStatus !== 'PERMANENT' && negativeEvidence) {
       if (scoreAfter >= policy.permanentBanScore) {
-        // سمعة حرجة ← حظر دائم
         banStatus = 'PERMANENT'
         bannedUntil = null
         bannedAt = now
         banReason = `سمعة حرجة (${scoreAfter}/10): ${reasonText}`
         isManualBan = false
       } else if (!isManualBan) {
-        const failTrigger = failedInc > 0 && failedAfter >= policy.autoBanAfterFails
+        const failTrigger =
+          failedInc > 0 && failedAfter >= policy.autoBanAfterFails
         const limitTrigger = hardLimitHit && policy.banOnMaxRequests
 
         if (failTrigger || limitTrigger) {
-          const until = new Date(nowMs + policy.temporaryBanMinutes * 60_000)
+          const until = new Date(
+            nowMs + policy.temporaryBanMinutes * 60_000,
+          )
 
           if (banStatus === 'TEMPORARY') {
-            // دليل جديد أثناء الحظر: بنمدّه
             if (!bannedUntil || until > bannedUntil) bannedUntil = until
           } else {
             banStatus = 'TEMPORARY'
@@ -1370,15 +1500,15 @@ export class ReputationService {
 
     const wasBanned = banBefore?.isCurrentlyBanned ?? false
     const newlyBanned = !wasBanned && banStatus !== 'NONE'
-    const escalated =
-      wasBanned && banBefore?.banStatusEffective === 'TEMPORARY' && banStatus === 'PERMANENT'
 
-    // ---- 7) الكتابة ----
     const knownBotnet =
       inheritedBotnet ||
-      (accepted.some((s) => s.type === 'KNOWN_BOTNET') && pointsApplied > 0)
+      (accepted.some((s) => s.type === 'KNOWN_BOTNET') &&
+        pointsApplied > 0)
 
-    const lastFailedAt = negativeEvidence ? now : (decay?.anchor ?? undefined)
+    const lastFailedAt = negativeEvidence
+      ? now
+      : (decay?.anchor ?? undefined)
 
     const data = {
       score: scoreAfter,
@@ -1397,20 +1527,30 @@ export class ReputationService {
     }
 
     const saved = existing
-      ? await tx.reputationEntry.update({ where: { id: existing.id }, data })
+      ? await tx.reputationEntry.update({
+          where: { id: existing.id },
+          data,
+        })
       : await tx.reputationEntry.create({
-          data: { organizationId, ipAddress, firstSeenAt: now, ...data },
+          data: {
+            organizationId,
+            ipAddress,
+            firstSeenAt: now,
+            ...data,
+          },
         })
 
     await this.logChallenge(tx, input, saved.id)
 
-    // ---- 8) الإشعارات (عند التحوّل فقط) ----
-    if (newlyBanned || escalated) {
+    if (newlyBanned) {
       await tx.notification.create({
         data: {
           organizationId,
           type: 'NEW_BLOCK',
-          title: banStatus === 'PERMANENT' ? 'حظر دائم تلقائي' : 'حظر مؤقت تلقائي',
+          title:
+            banStatus === 'PERMANENT'
+              ? 'حظر دائم تلقائي'
+              : 'حظر مؤقت تلقائي',
           message: `تم حظر ${ipAddress}: ${banReason ?? reasonText}`,
           severity: banStatus === 'PERMANENT' ? 4 : 3,
           metadata: {
@@ -1424,7 +1564,10 @@ export class ReputationService {
           } as Prisma.InputJsonObject,
         },
       })
-    } else if (scoreAfter >= CRITICAL_SCORE && scoreBefore < CRITICAL_SCORE) {
+    } else if (
+      scoreAfter >= CRITICAL_SCORE &&
+      scoreBefore < CRITICAL_SCORE
+    ) {
       await tx.notification.create({
         data: {
           organizationId,
@@ -1442,14 +1585,20 @@ export class ReputationService {
       })
     }
 
-    // ---- 9) الرد ----
     const signals: AppliedSignalResult[] = [
       ...accepted.map((s) => ({
         type: s.type,
-        points: round2(computeSignalPoints(s) * (computeSignalPoints(s) > 0 ? factor : 1)),
+        points: round2(
+          computeSignalPoints(s) *
+            (computeSignalPoints(s) > 0 ? factor : 1),
+        ),
         deduped: false,
       })),
-      ...dedupedTypes.map((type) => ({ type, points: 0, deduped: true })),
+      ...dedupedTypes.map((type) => ({
+        type,
+        points: 0,
+        deduped: true,
+      })),
     ]
 
     return {
@@ -1477,7 +1626,9 @@ export class ReputationService {
 
   private buildEnrichment(input: ApplyReputationInput) {
     return {
-      ...(input.deviceFingerprint && { deviceFingerprint: input.deviceFingerprint }),
+      ...(input.deviceFingerprint && {
+        deviceFingerprint: input.deviceFingerprint,
+      }),
       ...(input.ja3Fingerprint && { ja3Fingerprint: input.ja3Fingerprint }),
       ...(input.ja4Fingerprint && { ja4Fingerprint: input.ja4Fingerprint }),
       ...(input.countryCode && { countryCode: input.countryCode }),
@@ -1515,17 +1666,9 @@ export class ReputationService {
   }
 
   // ================================================================
-  // Gateway: مزامنة الحظر (للـ Redis)
+  // Gateway: مزامنة الحظر
   // ================================================================
 
-  /**
-   * أول تشغيل (من غير updatedSince): الحظر الساري + الأجهزة الموثوقة فقط.
-   * بعد كده (updatedSince): كل سجل اتغير حتى لو بقى NONE، عشان الـ Gateway يشيله.
-   * شركات موقوفة ما بتتبعتش. serverTime بيتاخد قبل الاستعلام فمفيش تعديل بيضيع.
-   *
-   * تنبيه: انتهاء الحظر المؤقت بالوقت مش بيغيّر الصف، فالـ Gateway لازم يحط
-   * TTL على المفتاح = bannedUntil.
-   */
   async listBansForGateway(
     query: GatewayBansQuery,
   ): Promise<GatewayBansListResult> {
@@ -1533,13 +1676,18 @@ export class ReputationService {
 
     const where: Prisma.ReputationEntryWhereInput = {
       organization: { isActive: true },
-      ...(query.organizationId && { organizationId: query.organizationId }),
+      ...(query.organizationId && {
+        organizationId: query.organizationId,
+      }),
       ...(query.updatedSince
         ? { updatedAt: { gt: new Date(query.updatedSince) } }
         : {
             OR: [
               { banStatus: 'PERMANENT' },
-              { banStatus: 'TEMPORARY', bannedUntil: { gt: serverTime } },
+              {
+                banStatus: 'TEMPORARY',
+                bannedUntil: { gt: serverTime },
+              },
               { isAllowlisted: true },
             ],
           }),

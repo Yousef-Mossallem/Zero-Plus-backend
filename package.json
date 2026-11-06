@@ -1,4 +1,5 @@
 {
+  "$schema": "https://json.schemastore.org/package",
   "name": "backend",
   "version": "1.0.0",
   "description": "Zero Plus Backend API",
@@ -23,6 +24,7 @@
     "@prisma/client": "^7.10.0",
     "@simplewebauthn/server": "^14.0.3",
     "bcrypt": "^6.0.0",
+    "bcryptjs": "^3.0.3",
     "dotenv": "^18.0.4",
     "fastify": "^5.12.5",
     "ioredis": "^6.0.0",
@@ -32,10 +34,14 @@
     "zod": "^4.6.5"
   },
   "devDependencies": {
-    "@types/bcrypt": "^6.0.0",
-    "@types/node": "^26.6.3",
+    "@types/bcrypt": "^5.0.2",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/node": "^26.6.5",
     "prisma": "^7.10.0",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=26.12.1"
   }
 }

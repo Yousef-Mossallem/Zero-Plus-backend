@@ -1,9 +1,32 @@
-FROM node:22-alpine              # نقطة البداية: Node (Prisma 7 محتاج 20.19 أو أحدث)
-WORKDIR /app                     # الشغل جوه فولدر /app
-COPY package*.json ./            # انسخ ملفات المكتبات الأول (عشان الكاش)
-RUN npm ci                       # ثبّت المكتبات بالظبط من package-lock
-COPY . .                         # انسخ باقي الكود
-RUN npx prisma generate          # ولّد Prisma Client جوه الصندوق
-RUN npm run build                # ابني الكود
+# ======================================================
+# Zero Plus — Backend (Fastify + Prisma)
+# Node 22 + migrate on start
+# ======================================================
+FROM node:22-alpine AS deps
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci
+
+FROM node:22-alpine AS build
+WORKDIR /app
+COPY --from=deps /app/node_modules ./node_modules
+COPY package.json package-lock.json ./
+COPY prisma ./prisma
+COPY prisma.config.ts* ./
+COPY tsconfig.json ./
+COPY src ./src
+RUN npx prisma generate
+RUN npm run build
+
+FROM node:22-alpine AS runner
+WORKDIR /app
+ENV NODE_ENV=production
+RUN apk add --no-cache openssl libc6-compat
+COPY --from=build /app/node_modules ./node_modules
+COPY --from=build /app/dist ./dist
+COPY --from=build /app/package.json ./
+COPY --from=build /app/prisma ./prisma
+COPY --from=build /app/prisma.config.ts* ./
 EXPOSE 4000
-CMD ["sh", "-c", "npx prisma migrate deploy && npm start"]
+# Render يحقن PORT — نستمع عليه في الكود أو نمرّره
+CMD ["sh", "-c", "npx prisma migrate deploy && node dist/server.js"]

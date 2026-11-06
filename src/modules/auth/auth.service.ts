@@ -6,7 +6,8 @@
 // ==================================================================
 
 import type { FastifyInstance } from 'fastify'
-import bcrypt from 'bcrypt'
+// بدلاً من: import bcrypt from 'bcrypt'
+import bcrypt from 'bcryptjs'
 import {
   generateRegistrationOptions,
   verifyRegistrationResponse,

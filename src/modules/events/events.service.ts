@@ -1,66 +1,115 @@
 // backend/src/modules/events/events.service.ts
+// ==================================================================
+// Zero Plus - Security Events Service
+// بعد إنشاء الحدث: بث لحظي للـ Dashboard عبر Socket.IO
+// ==================================================================
 
-import type { FastifyInstance } from 'fastify';
-import { Prisma } from '@prisma/client';
+import type { FastifyInstance } from 'fastify'
+import { Prisma } from '@prisma/client'
 
 import type {
   CreateEventInput,
   GetEventsQuery,
-} from './events.schema.js';
+} from './events.schema.js'
+import { SocketEvents } from '../../plugins/socket.plugin.js'
+import type { GatewayEventInput } from './events.internal.routes.js'
 
-/**
- * ================================================================
- * Zero Plus - Events Service
- * ================================================================
- *
- * مسؤول عن:
- * - إنشاء Security Events
- * - التأكد أن الـ Server تابع لنفس الـ Organization
- * - التأكد أن Reputation Entry تابع لنفس الـ Organization
- * - جلب الـ Events مع Filtering / Pagination / Sorting
- * - جلب Event واحد بالتفصيل
- *
- * ملاحظة:
- * الـ Events تعتبر Audit/Security Logs لذلك لا يوجد هنا:
- * - updateEvent
- * - deleteEvent
- *
- * لأنها في النظام المفروض تكون immutable.
- * ================================================================
- */
+// ------------------------------------------------------------------
+// Errors
+// ------------------------------------------------------------------
 
-/**
- * Error مخصص نستخدمه مع Fastify
- * حتى يرجع HTTP status مناسب بدل 500.
- */
 class EventServiceError extends Error {
-  public readonly statusCode: number;
+  public readonly statusCode: number
 
   constructor(message: string, statusCode: number) {
-    super(message);
-    this.name = 'EventServiceError';
-    this.statusCode = statusCode;
+    super(message)
+    this.name = 'EventServiceError'
+    this.statusCode = statusCode
+  }
+}
+
+// ------------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------------
+
+/**
+ * قرارات تستحق ظهور فوري أوضح في الـ Live feed.
+ * باقي الأحداث برضو بتتبعت، بس الفرونت يقدر يفلتر.
+ */
+const HIGHLIGHT_DECISIONS = new Set(['BLOCK', 'CHALLENGE', 'RATE_LIMIT', 'MONITOR'])
+
+/**
+ * Payload خفيف للـ Socket — مش الصف كامل من DB.
+ */
+function toRealtimePayload(event: {
+  id: string
+  organizationId: string
+  serverId: string
+  ipAddress: string
+  path: string
+  method: string
+  riskScore: number
+  anomalyScore: number | null
+  confidence: number | null
+  decision: string
+  reasonSummary: string | null
+  countryCode: string | null
+  ipType: string | null
+  isChallenged: boolean
+  challengePassed: boolean | null
+  createdAt: Date
+}) {
+  return {
+    id: event.id,
+    organizationId: event.organizationId,
+    serverId: event.serverId,
+    ipAddress: event.ipAddress,
+    path: event.path,
+    method: event.method,
+    riskScore: event.riskScore,
+    anomalyScore: event.anomalyScore,
+    confidence: event.confidence,
+    decision: event.decision,
+    reasonSummary: event.reasonSummary,
+    countryCode: event.countryCode,
+    ipType: event.ipType,
+    isChallenged: event.isChallenged,
+    challengePassed: event.challengePassed,
+    createdAt: event.createdAt.toISOString(),
+    highlight: HIGHLIGHT_DECISIONS.has(event.decision),
   }
 }
 
 /**
- * ================================================================
- * CREATE EVENT
- * ================================================================
+ * بث آمن: لو Socket مش متسجل (اختبارات) متعملش crash.
  */
+function emitSecurityEvent(
+  fastify: FastifyInstance,
+  organizationId: string,
+  payload: ReturnType<typeof toRealtimePayload>,
+) {
+  try {
+    if (typeof fastify.broadcastToOrg === 'function') {
+      fastify.broadcastToOrg(
+        organizationId,
+        SocketEvents.SECURITY_EVENT_NEW,
+        payload,
+      )
+    }
+  } catch (err) {
+    fastify.log.warn({ err, organizationId }, 'Failed to broadcast security_event:new')
+  }
+}
+
+// ------------------------------------------------------------------
+// CREATE EVENT
+// ------------------------------------------------------------------
+
 export async function createEvent(
   fastify: FastifyInstance,
   organizationId: string,
   data: CreateEventInput,
 ) {
-  /**
-   * --------------------------------------------------------------
-   * 1. التأكد أن الـ Server موجود وتابع لنفس الـ Organization
-   * --------------------------------------------------------------
-   *
-   * مهم جدًا لمنع شركة من تسجيل Event على Server
-   * تابع لشركة أخرى.
-   */
   const server = await fastify.prisma.server.findFirst({
     where: {
       id: data.serverId,
@@ -69,20 +118,15 @@ export async function createEvent(
     select: {
       id: true,
     },
-  });
+  })
 
   if (!server) {
     throw new EventServiceError(
       'السيرفر غير موجود أو لا ينتمي إلى هذه المؤسسة',
       404,
-    );
+    )
   }
 
-  /**
-   * --------------------------------------------------------------
-   * 2. لو فيه Reputation Entry نتأكد أنه تابع لنفس المؤسسة
-   * --------------------------------------------------------------
-   */
   if (data.reputationEntryId) {
     const reputationEntry =
       await fastify.prisma.reputationEntry.findFirst({
@@ -93,28 +137,16 @@ export async function createEvent(
         select: {
           id: true,
         },
-      });
+      })
 
     if (!reputationEntry) {
       throw new EventServiceError(
         'Reputation Entry غير موجود أو لا ينتمي إلى هذه المؤسسة',
         404,
-      );
+      )
     }
   }
 
-  /**
-   * --------------------------------------------------------------
-   * 3. إنشاء الـ Event
-   * --------------------------------------------------------------
-   *
-   * ممنوع استخدام:
-   *
-   *   ...data
-   *
-   * لأننا نريد التحكم في الـ fields التي تدخل قاعدة البيانات
-   * وعدم السماح لأي field غير متوقع بالدخول.
-   */
   const event = await fastify.prisma.securityEvent.create({
     data: {
       serverId: data.serverId,
@@ -124,9 +156,9 @@ export async function createEvent(
       path: data.path,
       method: data.method,
 
-      userAgent: data.userAgent,
-      referer: data.referer,
-      requestId: data.requestId,
+      userAgent: data.userAgent ?? null,
+      referer: data.referer ?? null,
+      requestId: data.requestId ?? null,
 
       riskScore: data.riskScore,
       anomalyScore: data.anomalyScore,
@@ -134,203 +166,125 @@ export async function createEvent(
 
       decision: data.decision,
 
-      reasonSummary: data.reasonSummary,
+      reasonSummary: data.reasonSummary ?? null,
 
-      /**
-       * Prisma Json يحتاج InputJsonValue.
-       * الـ schema عندنا يسمح Record<string, unknown>
-       * لذلك نعمل cast هنا بعد التحقق بواسطة Zod.
-       */
       reasonDetails: data.reasonDetails
         ? (data.reasonDetails as Prisma.InputJsonObject)
-        : undefined,
+        : Prisma.JsonNull,
 
-      countryCode: data.countryCode,
-      asn: data.asn,
-      ipType: data.ipType,
+      countryCode: data.countryCode ?? null,
+      asn: data.asn ?? null,
+      ipType: data.ipType ?? null,
 
       isChallenged: data.isChallenged ?? false,
-      challengePassed: data.challengePassed,
+      challengePassed: data.challengePassed ?? null,
 
-      reputationEntryId: data.reputationEntryId,
+      reputationEntryId: data.reputationEntryId ?? null,
     },
-  });
+  })
 
-  return event;
+  // ------------------------------------------------------------------
+  // Realtime: Dashboard Live Traffic / Security Events
+  // ------------------------------------------------------------------
+  emitSecurityEvent(
+    fastify,
+    organizationId,
+    toRealtimePayload(event),
+  )
+
+  return event
 }
 
-/**
- * ================================================================
- * GET EVENTS
- * ================================================================
- */
+// ------------------------------------------------------------------
+// GET EVENTS
+// ------------------------------------------------------------------
+
 export async function getEvents(
   fastify: FastifyInstance,
   organizationId: string,
   query: GetEventsQuery,
 ) {
-  /**
-   * --------------------------------------------------------------
-   * Pagination
-   * --------------------------------------------------------------
-   *
-   * page و limit تم تحويلهم بالفعل إلى numbers
-   * داخل Zod schema.
-   */
-  const page = query.page;
-  const limit = query.limit;
+  const page = query.page
+  const limit = query.limit
+  const skip = (page - 1) * limit
 
-  const skip = (page - 1) * limit;
-
-  /**
-   * --------------------------------------------------------------
-   * Base WHERE
-   * --------------------------------------------------------------
-   *
-   * أهم نقطة في Events:
-   *
-   * كل Query لازم يبدأ بـ organizationId
-   * حتى لا يرى المستخدم Events الخاصة بمؤسسة أخرى.
-   */
   const where: Prisma.SecurityEventWhereInput = {
     organizationId,
-  };
+  }
 
-  /**
-   * --------------------------------------------------------------
-   * Server Filter
-   * --------------------------------------------------------------
-   */
   if (query.serverId) {
-    where.serverId = query.serverId;
+    where.serverId = query.serverId
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Decision Filter
-   * --------------------------------------------------------------
-   */
   if (query.decision) {
-    where.decision = query.decision;
+    where.decision = query.decision
   }
 
-  /**
-   * --------------------------------------------------------------
-   * IP Address Filter
-   * --------------------------------------------------------------
-   */
   if (query.ipAddress) {
     where.ipAddress = {
       contains: query.ipAddress,
       mode: 'insensitive',
-    };
+    }
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Country
-   * --------------------------------------------------------------
-   */
   if (query.countryCode) {
-    where.countryCode = query.countryCode;
+    where.countryCode = query.countryCode
   }
 
-  /**
-   * --------------------------------------------------------------
-   * IP Type
-   * --------------------------------------------------------------
-   */
   if (query.ipType) {
-    where.ipType = query.ipType;
+    where.ipType = query.ipType
   }
 
-  /**
-   * --------------------------------------------------------------
-   * HTTP Method
-   * --------------------------------------------------------------
-   */
   if (query.method) {
-    where.method = query.method;
+    where.method = query.method
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Path
-   * --------------------------------------------------------------
-   */
   if (query.path) {
     where.path = {
       contains: query.path,
       mode: 'insensitive',
-    };
+    }
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Risk Score Range
-   * --------------------------------------------------------------
-   */
   if (
     query.minRiskScore !== undefined ||
     query.maxRiskScore !== undefined
   ) {
-    where.riskScore = {};
+    where.riskScore = {}
 
     if (query.minRiskScore !== undefined) {
-      where.riskScore.gte = query.minRiskScore;
+      where.riskScore.gte = query.minRiskScore
     }
 
     if (query.maxRiskScore !== undefined) {
-      where.riskScore.lte = query.maxRiskScore;
+      where.riskScore.lte = query.maxRiskScore
     }
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Challenge Filters
-   * --------------------------------------------------------------
-   */
   if (query.isChallenged !== undefined) {
-    where.isChallenged = query.isChallenged;
+    where.isChallenged = query.isChallenged
   }
 
   if (query.challengePassed !== undefined) {
-    where.challengePassed = query.challengePassed;
+    where.challengePassed = query.challengePassed
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Reputation Entry Filter
-   * --------------------------------------------------------------
-   */
   if (query.reputationEntryId) {
-    where.reputationEntryId = query.reputationEntryId;
+    where.reputationEntryId = query.reputationEntryId
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Date Range
-   * --------------------------------------------------------------
-   */
   if (query.startDate || query.endDate) {
-    where.createdAt = {};
+    where.createdAt = {}
 
     if (query.startDate) {
-      where.createdAt.gte = new Date(query.startDate);
+      where.createdAt.gte = new Date(query.startDate)
     }
 
     if (query.endDate) {
-      where.createdAt.lte = new Date(query.endDate);
+      where.createdAt.lte = new Date(query.endDate)
     }
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Global Search
-   * --------------------------------------------------------------
-   *
-   * يبحث في أهم الحقول النصية.
-   */
   if (query.search) {
     where.OR = [
       {
@@ -341,12 +295,6 @@ export async function getEvents(
       },
       {
         path: {
-          contains: query.search,
-          mode: 'insensitive',
-        },
-      },
-      {
-        method: {
           contains: query.search,
           mode: 'insensitive',
         },
@@ -375,47 +323,29 @@ export async function getEvents(
           mode: 'insensitive',
         },
       },
-    ];
+    ]
   }
 
-  /**
-   * --------------------------------------------------------------
-   * Sorting
-   * --------------------------------------------------------------
-   *
-   * الـ schema يمنع أي field غير الموجود في القائمة.
-   * هنا فقط نربطه بحقول Prisma.
-   */
   const sortFieldMap = {
     createdAt: 'createdAt',
     riskScore: 'riskScore',
     ipAddress: 'ipAddress',
     decision: 'decision',
     serverId: 'serverId',
-  } as const;
+  } as const
 
-  const sortField = sortFieldMap[query.sortBy];
+  const sortField = sortFieldMap[query.sortBy]
 
   const orderBy: Prisma.SecurityEventOrderByWithRelationInput = {
     [sortField]: query.sortOrder,
-  };
+  }
 
-  /**
-   * --------------------------------------------------------------
-   * Query Database
-   * --------------------------------------------------------------
-   */
   const [events, total, aggregate] = await Promise.all([
     fastify.prisma.securityEvent.findMany({
       where,
       skip,
       take: limit,
       orderBy,
-
-      /**
-       * نجيب الـ server كـ summary بسيط
-       * بدل ما نرجع كل بياناته.
-       */
       include: {
         server: {
           select: {
@@ -436,25 +366,13 @@ export async function getEvents(
         riskScore: true,
       },
     }),
-  ]);
+  ])
 
-  /**
-   * --------------------------------------------------------------
-   * Summary
-   * --------------------------------------------------------------
-   *
-   * أرقام إضافية مفيدة للـ dashboard.
-   */
   const summary = {
     totalEvents: total,
     averageRiskScore: aggregate._avg.riskScore ?? 0,
-  };
+  }
 
-  /**
-   * --------------------------------------------------------------
-   * Response
-   * --------------------------------------------------------------
-   */
   return {
     success: true,
 
@@ -470,34 +388,25 @@ export async function getEvents(
     },
 
     summary,
-  };
+  }
 }
 
-/**
- * ================================================================
- * GET EVENT BY ID
- * ================================================================
- */
+// ------------------------------------------------------------------
+// GET EVENT BY ID
+// ------------------------------------------------------------------
+
+
+
 export async function getEventById(
   fastify: FastifyInstance,
   organizationId: string,
   eventId: string,
 ) {
-  /**
-   * organizationId جزء أساسي من الـ where
-   * حتى لو المستخدم يعرف ID Event خاص بشركة أخرى
-   * لن يستطيع الوصول إليه.
-   */
   const event = await fastify.prisma.securityEvent.findFirst({
     where: {
       id: eventId,
       organizationId,
     },
-
-    /**
-     * صفحة التفاصيل تحتاج معلومات الـ Server
-     * والـ Reputation المرتبطة بالحدث.
-     */
     include: {
       server: {
         select: {
@@ -518,7 +427,86 @@ export async function getEventById(
         },
       },
     },
-  });
+  })
 
-  return event;
+  return event
+}
+// ------------------------------------------------------------------
+// CREATE EVENT (من الـ Gateway) — بيدعم كل حقول السكيما
+// ------------------------------------------------------------------
+
+export async function createGatewayEvent(
+  fastify: FastifyInstance,
+  data: GatewayEventInput,
+) {
+  const { organizationId } = data
+
+  const server = await fastify.prisma.server.findFirst({
+    where: { id: data.serverId, organizationId },
+    select: { id: true },
+  })
+
+  if (!server) {
+    throw new EventServiceError(
+      'السيرفر غير موجود أو لا ينتمي إلى هذه المؤسسة',
+      404,
+    )
+  }
+
+  if (data.reputationEntryId) {
+    const entry = await fastify.prisma.reputationEntry.findFirst({
+      where: { id: data.reputationEntryId, organizationId },
+      select: { id: true },
+    })
+
+    if (!entry) {
+      throw new EventServiceError(
+        'Reputation Entry غير موجود أو لا ينتمي إلى هذه المؤسسة',
+        404,
+      )
+    }
+  }
+
+  const event = await fastify.prisma.securityEvent.create({
+    data: {
+      organizationId,
+      serverId: data.serverId,
+
+      ipAddress: data.ipAddress,
+      path: data.path,
+      method: data.method,
+      userAgent: data.userAgent ?? null,
+      referer: data.referer ?? null,
+      requestId: data.requestId ?? null,
+
+      riskScore: data.riskScore,
+      anomalyScore: data.anomalyScore ?? null,
+      confidence: data.confidence ?? null,
+      decision: data.decision,
+      decidedAtStage: data.decidedAtStage ?? null,
+      reasonSummary: data.reasonSummary ?? null,
+      reasonDetails: data.reasonDetails
+        ? (data.reasonDetails as Prisma.InputJsonObject)
+        : Prisma.JsonNull,
+      processingTimeMs: data.processingTimeMs ?? null,
+
+      surgeDetected: data.surgeDetected ?? false,
+      pathSensitive: data.pathSensitive ?? false,
+      recommendation: data.recommendation ?? null,
+
+      countryCode: data.countryCode ?? null,
+      asn: data.asn ?? null,
+      ipType: data.ipType ?? null,
+
+      isChallenged: data.isChallenged ?? false,
+      challengeType: data.challengeType ?? null,
+      challengePassed: data.challengePassed ?? null,
+
+      reputationEntryId: data.reputationEntryId ?? null,
+    },
+  })
+
+  emitSecurityEvent(fastify, organizationId, toRealtimePayload(event))
+
+  return event
 }

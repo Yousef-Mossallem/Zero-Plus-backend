@@ -10,6 +10,7 @@
 //   GET    /:id/dns                  تعليمات الـ DNS                  (أي مستخدم)
 //   PATCH  /:id                      تعديل                            (OWNER, ADMIN)
 //   POST   /:id/verify               فحص الـ DNS (ملكية / توجيه)      (OWNER, ADMIN)
+//   POST   /:id/probe                إعادة قياس السعة (Origin Probe)  (OWNER, ADMIN)
 //   POST   /:id/maintenance          تشغيل/إيقاف الصيانة              (OWNER, ADMIN)
 //   DELETE /:id?confirmDomain=       حذف بتأكيد الدومين               (OWNER, ADMIN)
 //
@@ -66,7 +67,7 @@ function handleRouteError(
   error: unknown,
 ) {
   if (error instanceof ServerServiceError) {
-    // Retry-After للتحقق المتكرر
+    // Retry-After للتحقق المتكرر / تبريد القياس
     if (error.statusCode === 429) {
       const retry = (error.details as { retryAfterSec?: number } | undefined)
         ?.retryAfterSec
@@ -307,6 +308,30 @@ export async function serverRoutes(fastify: FastifyInstance) {
   })
 
   // ================================================================
+  // POST /servers/:id/probe
+  // إعادة قياس السعة (Origin Probe) — OWNER, ADMIN
+  // يرد 202 فورًا؛ النتيجة توصل عبر Socket بعد انتهاء القياس
+  // ================================================================
+  fastify.post('/:id/probe', manage, async (request, reply) => {
+    const params = serverIdParamsSchema.safeParse(request.params)
+
+    if (!params.success) {
+      return sendValidationError(reply, 'معرف السيرفر غير صالح', params.error)
+    }
+
+    try {
+      await service.requestProbe(request.user.organizationId, params.data.id)
+
+      return reply.status(202).send({
+        success: true,
+        message: 'تم بدء القياس. النتيجة هتوصل خلال دقيقتين تقريباً',
+      })
+    } catch (error) {
+      return handleRouteError(request, reply, error)
+    }
+  })
+
+  // ================================================================
   // POST /servers/:id/maintenance
   // Body: { "enabled": true | false }
   // ================================================================
@@ -320,7 +345,11 @@ export async function serverRoutes(fastify: FastifyInstance) {
     const body = maintenanceSchema.safeParse(request.body)
 
     if (!body.success) {
-      return sendValidationError(reply, 'enabled مطلوب (true أو false)', body.error)
+      return sendValidationError(
+        reply,
+        'enabled مطلوب (true أو false)',
+        body.error,
+      )
     }
 
     try {
@@ -346,7 +375,6 @@ export async function serverRoutes(fastify: FastifyInstance) {
 
   // ================================================================
   // DELETE /servers/:id?confirmDomain=shop.example.com
-  // بيحذف معاه كل الأحداث وسجلات الاختبارات (Cascade)
   // ================================================================
   fastify.delete('/:id', manage, async (request, reply) => {
     const params = serverIdParamsSchema.safeParse(request.params)
